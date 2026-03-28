@@ -475,7 +475,13 @@ async def run_fantrax_sync():
                 }, on_conflict="stat_date,fantasy_team,stat_type").execute()
 
             # Recompute monthly totals from daily_stats
-            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .like("stat_date", f"{month_str}%")                .eq("stat_type", active_stat)                .execute().data
+            # Use gte/lte instead of like — stat_date is a DATE column
+            import calendar
+            year, mon = int(month_str[:4]), int(month_str[5:7])
+            last_day = calendar.monthrange(year, mon)[1]
+            month_start = f"{month_str}-01"
+            month_end = f"{month_str}-{last_day:02d}"
+            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .gte("stat_date", month_start)                .lte("stat_date", month_end)                .eq("stat_type", active_stat)                .execute().data
 
             monthly_totals = {t: 0 for t in TEAMS}
             for row in all_daily:
