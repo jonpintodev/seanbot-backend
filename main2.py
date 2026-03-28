@@ -93,12 +93,12 @@ async def fantrax_get(path: str, params: dict = None) -> Optional[dict]:
 # Cache: player name -> MLBAM ID
 MLBAM_ID_CACHE: dict = {}
 
-async def get_mlbam_id(name: str) -> Optional[int]:
-    """Search MLB Stats API by full name to get MLBAM player ID."""
-    if name in MLBAM_ID_CACHE:
-        return MLBAM_ID_CACHE[name]
+async def get_mlbam_id(name: str, mlb_team: str = "") -> Optional[int]:
+    """Search MLB Stats API by full name + team to get correct MLBAM player ID."""
+    cache_key = f"{name}|{mlb_team}"
+    if cache_key in MLBAM_ID_CACHE:
+        return MLBAM_ID_CACHE[cache_key]
     try:
-        # Search by last name
         parts = name.strip().split()
         last = parts[-1] if parts else ""
         first = parts[0] if len(parts) > 1 else ""
@@ -107,42 +107,58 @@ async def get_mlbam_id(name: str) -> Optional[int]:
             resp = await c.get(url)
         people = resp.json().get("people", [])
         name_lower = name.lower()
-        # Priority 1: exact full name match
+
+        # Priority 1: exact full name + team abbreviation match
+        if mlb_team:
+            for p in people:
+                full = p.get("fullName", "").lower()
+                team_abbr = p.get("currentTeam", {}).get("abbreviation", "")
+                if full == name_lower and team_abbr.upper() == mlb_team.upper():
+                    mlbam_id = p.get("id")
+                    if mlbam_id:
+                        MLBAM_ID_CACHE[cache_key] = mlbam_id
+                        return mlbam_id
+
+        # Priority 2: exact full name match (any team)
         for p in people:
             if p.get("fullName", "").lower() == name_lower:
                 mlbam_id = p.get("id")
                 if mlbam_id:
-                    MLBAM_ID_CACHE[name] = mlbam_id
+                    MLBAM_ID_CACHE[cache_key] = mlbam_id
                     return mlbam_id
-        # Priority 2: first + last name both present
+
+        # Priority 3: first + last both in name + team match
+        if first and mlb_team:
+            for p in people:
+                full = p.get("fullName", "").lower()
+                team_abbr = p.get("currentTeam", {}).get("abbreviation", "")
+                if (first.lower() in full and last.lower() in full
+                        and team_abbr.upper() == mlb_team.upper()):
+                    mlbam_id = p.get("id")
+                    if mlbam_id:
+                        MLBAM_ID_CACHE[cache_key] = mlbam_id
+                        return mlbam_id
+
+        # Priority 4: first + last both in name (no team filter)
         if first:
             for p in people:
                 full = p.get("fullName", "").lower()
                 if first.lower() in full and last.lower() in full:
                     mlbam_id = p.get("id")
                     if mlbam_id:
-                        MLBAM_ID_CACHE[name] = mlbam_id
+                        MLBAM_ID_CACHE[cache_key] = mlbam_id
                         return mlbam_id
-        # Priority 3: active players only (useCurrent=true)
-        url2 = f"https://statsapi.mlb.com/api/v1/people/search?names={last}&sportId=1&active=true"
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp2 = await c.get(url2)
-        people2 = resp2.json().get("people", [])
-        if len(people2) == 1:
-            mlbam_id = people2[0].get("id")
-            if mlbam_id:
-                MLBAM_ID_CACHE[name] = mlbam_id
-                return mlbam_id
+
     except Exception as e:
-        logger.error(f"MLBAM lookup error for {name}: {e}")
+        logger.error(f"MLBAM lookup error for {name} ({mlb_team}): {e}")
     return None
 
 
-async def get_mlb_stats(player_name: str) -> dict:
-    """Get season batting + pitching stats from MLB Stats API using player name."""
+async def get_mlb_stats(player_name: str, mlb_team: str = "") -> dict:
+    """Get season batting + pitching stats from MLB Stats API using player name + team."""
     empty = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
     try:
-        mlbam_id = await get_mlbam_id(player_name)
+        mlbam_id = await get_mlbam_id(player_name, mlb_team)
         if not mlbam_id:
             return empty
         url = f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats?stats=season&season={date.today().year}&group=hitting,pitching"
@@ -319,11 +335,10 @@ async def run_fantrax_sync():
 
             stats = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
             if name and name != fantrax_pid:
-                stats = await get_mlb_stats(name)
+                stats = await get_mlb_stats(name, mlb_team)
                 stats_calls += 1
-                # Zero out stats not needed this month to keep totals clean
-                import datetime
-                m = datetime.date.today().month
+                # Zero out stats not needed this month
+                m = date.today().month
                 if m not in (3, 4):  stats["rbi"] = 0
                 if m != 5:           stats["k"] = 0
                 if m != 6:           stats["h"] = 0
