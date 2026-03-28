@@ -1,12 +1,23 @@
 """
 SeanBot 1.0 - Rusty Kuntz Dynasty League
-Uses getPlayerIds for real names + MLB Stats API for season stats
+Monthly prize tracker using daily started-lineup accounting.
+
+Flow (nightly after Force Sync):
+  1. Get today's Fantrax scoring day + all team lineups
+  2. Mark each player active (started) or inactive (bench/IL/NA)
+  3. For each active player, fetch their stat for today from MLB game log
+  4. Store: scoring_days, daily_lineups, daily_player_stats
+  5. Recompute monthly_totals by joining lineups + stats (active only)
+  6. Write leaderboard to team_stats for frontend display
+
+Stat categories by month:
+  March/April = RBI, May = K, June = H, July = SB, August = HR, Sept = manual
 """
 
 import os
 import asyncio
+import calendar
 import logging
-import json
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -17,19 +28,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from supabase import create_client, Client
 
-try:
-    from fantraxapi import FanTraxAPI
-    FANTRAXAPI_AVAILABLE = True
-except ImportError:
-    FANTRAXAPI_AVAILABLE = False
-    logger = None  # will be set below
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("seanbot")
 ET = ZoneInfo("America/New_York")
 
 app = FastAPI(title="SeanBot 1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"],
+    allow_methods=["GET", "POST"], allow_headers=["*"]
+)
 
 FANTRAX_USERNAME  = os.environ.get("FANTRAX_USERNAME", "")
 FANTRAX_PASSWORD  = os.environ.get("FANTRAX_PASSWORD", "")
@@ -38,17 +45,32 @@ SUPABASE_URL      = os.environ.get("SUPABASE_URL", "https://haaaaugigaryryqjuztx
 SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhhYWFhdWdpZ2FyeXJ5cWp1enR4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDY2OTk3NywiZXhwIjoyMDkwMjQ1OTc3fQ.1mPiznawXi-2AtDqfIQET7hjWw5fuk-zRU9aPgQnNDQ")
 ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "changeme123")
 
-supabase: Optional[Client] = None
+LEAGUE_START_DATE = date(2026, 3, 27)
+
+# Slots that count as INACTIVE — stats from these do NOT count
+INACTIVE_SLOTS = {"BN", "IL", "IL+", "NA", "MINORS", "RES", "IR", "INJURED_RESERVE"}
+
+# Month -> stat category
+def active_stat_for_month(m: int) -> str:
+    return {3: "rbi", 4: "rbi", 5: "k", 6: "h", 7: "sb", 8: "hr"}.get(m, "rbi")
+
 TEAMS = [
-    "Possibilities", "Yoshi’s Islanders", "thebigfur", "Red Birds",
-    "Daddy Yankee", "¡pinto!", "JoanMacias", "Xavier", "Los Jankees",
+    "Possibilities", "Yoshi\u2019s Islanders", "thebigfur", "Red Birds",
+    "Daddy Yankee", "\u00a1pinto!", "JoanMacias", "Xavier", "Los Jankees",
     "Momin8421", "ericliaci", "Sho Me The Money",
     "Designated Shitters", "Arraezed & Hoerny"
 ]
+
+supabase: Optional[Client] = None
 sync_state = {"last_sync_date": None, "syncing": False, "last_sync_time": None, "status": "idle"}
 COOKIES = {}
 FANTRAX_LOGGED_IN = False
+MLBAM_CACHE: dict = {}
 
+
+# ─────────────────────────────────────────────
+# Fantrax auth + HTTP helpers
+# ─────────────────────────────────────────────
 
 async def fantrax_login() -> bool:
     global FANTRAX_LOGGED_IN, COOKIES
@@ -62,7 +84,7 @@ async def fantrax_login() -> bool:
         if resp.status_code == 200:
             COOKIES = dict(resp.cookies)
             FANTRAX_LOGGED_IN = True
-            logger.info(f"Login OK. Cookies: {list(COOKIES.keys())}")
+            logger.info(f"Fantrax login OK. Cookies: {list(COOKIES.keys())}")
             return True
     except Exception as e:
         logger.error(f"Login error: {e}")
@@ -92,19 +114,122 @@ async def fantrax_get(path: str, params: dict = None) -> Optional[dict]:
             COOKIES[k] = v
         if resp.status_code == 200:
             return resp.json()
+        logger.warning(f"Fantrax {path} returned {resp.status_code}")
     except Exception as e:
-        logger.error(f"GET error {path}: {e}")
+        logger.error(f"Fantrax GET error {path}: {e}")
     return None
 
 
-# Cache: player name -> MLBAM ID
-MLBAM_ID_CACHE: dict = {}
+# ─────────────────────────────────────────────
+# Team name normalisation
+# ─────────────────────────────────────────────
+
+def norm_team(s: str) -> str:
+    """Normalise apostrophes/quotes for fuzzy team matching."""
+    return s.replace("\u2019", "'").replace("\u2018", "'").lower().strip()
+
+
+def match_team(fantrax_name: str) -> Optional[str]:
+    if fantrax_name in TEAMS:
+        return fantrax_name
+    for t in TEAMS:
+        if norm_team(t) == norm_team(fantrax_name):
+            return t
+    return None
+
+
+# ─────────────────────────────────────────────
+# STEP 1 — Fetch lineups for a scoring date
+# ─────────────────────────────────────────────
+
+async def fetch_lineups_for_date(score_date: str) -> list[dict]:
+    """
+    Call Fantrax getTeamRosters for today.
+    Returns list of dicts:
+      {fantrax_player_id, player_name, fantasy_team, mlb_team, slot, is_active}
+    """
+    roster_data = await fantrax_get(
+        "/fxea/general/getTeamRosters",
+        {"leagueId": FANTRAX_LEAGUE_ID}
+    )
+    if not roster_data or not isinstance(roster_data.get("rosters"), dict):
+        logger.error("getTeamRosters returned no data")
+        return []
+
+    # Build player id -> name/team/pos from getPlayerIds
+    player_ids_data = await fantrax_get("/fxea/general/getPlayerIds", {"sport": "MLB"})
+
+    player_info = {}
+    if isinstance(player_ids_data, dict):
+        for pid, pdata in player_ids_data.items():
+            if isinstance(pdata, dict):
+                raw = pdata.get("name", "")
+                if raw and "," in raw:
+                    parts = raw.split(",", 1)
+                    name = f"{parts[1].strip()} {parts[0].strip()}"
+                else:
+                    name = raw
+                player_info[str(pid)] = {
+                    "name": name,
+                    "team": pdata.get("team", ""),
+                    "position": pdata.get("position", ""),
+                }
+        del player_ids_data
+
+    rows = []
+    for team_id, team_info in roster_data["rosters"].items():
+        if not isinstance(team_info, dict):
+            continue
+        fantrax_team_name = team_info.get("teamName", "")
+        matched = match_team(fantrax_team_name)
+        if not matched:
+            logger.warning(f"No team match: '{fantrax_team_name}'")
+            continue
+
+        for player in team_info.get("rosterItems", []):
+            if not isinstance(player, dict):
+                continue
+            pid = str(player.get("id", ""))
+            if not pid:
+                continue
+
+            # Slot determines active vs inactive
+            # Fantrax returns slot info in various fields — check all
+            slot = (
+                player.get("lineupStatus") or
+                player.get("slot") or
+                player.get("slotName") or
+                player.get("status") or
+                "BN"
+            ).upper().strip()
+
+            is_active = slot not in INACTIVE_SLOTS
+
+            pinfo = player_info.get(pid, {})
+            rows.append({
+                "fantrax_player_id": pid,
+                "player_name": pinfo.get("name", pid),
+                "fantasy_team": matched,
+                "mlb_team": pinfo.get("team", ""),
+                "slot": slot,
+                "is_active": is_active,
+                "score_date": score_date,
+                "updated_at": score_date,
+            })
+
+    logger.info(f"Lineups fetched: {len(rows)} players, "
+                f"{sum(1 for r in rows if r['is_active'])} active")
+    return rows
+
+
+# ─────────────────────────────────────────────
+# STEP 2 — Fetch MLB stat for one player on one date
+# ─────────────────────────────────────────────
 
 async def get_mlbam_id(name: str, mlb_team: str = "") -> Optional[int]:
-    """Search MLB Stats API by full name + team to get correct MLBAM player ID."""
     cache_key = f"{name}|{mlb_team}"
-    if cache_key in MLBAM_ID_CACHE:
-        return MLBAM_ID_CACHE[cache_key]
+    if cache_key in MLBAM_CACHE:
+        return MLBAM_CACHE[cache_key]
     try:
         parts = name.strip().split()
         last = parts[-1] if parts else ""
@@ -115,182 +240,132 @@ async def get_mlbam_id(name: str, mlb_team: str = "") -> Optional[int]:
         people = resp.json().get("people", [])
         name_lower = name.lower()
 
-        # Priority 1: exact full name + team abbreviation match
+        # Priority 1: exact name + team
         if mlb_team:
             for p in people:
-                full = p.get("fullName", "").lower()
-                team_abbr = p.get("currentTeam", {}).get("abbreviation", "")
-                if full == name_lower and team_abbr.upper() == mlb_team.upper():
-                    mlbam_id = p.get("id")
-                    if mlbam_id:
-                        MLBAM_ID_CACHE[cache_key] = mlbam_id
-                        return mlbam_id
-
-        # Priority 2: exact full name match (any team)
+                if (p.get("fullName", "").lower() == name_lower and
+                        p.get("currentTeam", {}).get("abbreviation", "").upper() == mlb_team.upper()):
+                    mid = p.get("id")
+                    if mid:
+                        MLBAM_CACHE[cache_key] = mid
+                        return mid
+        # Priority 2: exact name
         for p in people:
             if p.get("fullName", "").lower() == name_lower:
-                mlbam_id = p.get("id")
-                if mlbam_id:
-                    MLBAM_ID_CACHE[cache_key] = mlbam_id
-                    return mlbam_id
-
-        # Priority 3: first + last both in name + team match
+                mid = p.get("id")
+                if mid:
+                    MLBAM_CACHE[cache_key] = mid
+                    return mid
+        # Priority 3: first + last + team
         if first and mlb_team:
             for p in people:
                 full = p.get("fullName", "").lower()
-                team_abbr = p.get("currentTeam", {}).get("abbreviation", "")
-                if (first.lower() in full and last.lower() in full
-                        and team_abbr.upper() == mlb_team.upper()):
-                    mlbam_id = p.get("id")
-                    if mlbam_id:
-                        MLBAM_ID_CACHE[cache_key] = mlbam_id
-                        return mlbam_id
-
-        # Priority 4: first + last both in name (no team filter)
+                abbr = p.get("currentTeam", {}).get("abbreviation", "").upper()
+                if first.lower() in full and last.lower() in full and abbr == mlb_team.upper():
+                    mid = p.get("id")
+                    if mid:
+                        MLBAM_CACHE[cache_key] = mid
+                        return mid
+        # Priority 4: first + last
         if first:
             for p in people:
                 full = p.get("fullName", "").lower()
                 if first.lower() in full and last.lower() in full:
-                    mlbam_id = p.get("id")
-                    if mlbam_id:
-                        MLBAM_ID_CACHE[cache_key] = mlbam_id
-                        return mlbam_id
-
+                    mid = p.get("id")
+                    if mid:
+                        MLBAM_CACHE[cache_key] = mid
+                        return mid
     except Exception as e:
-        logger.error(f"MLBAM lookup error for {name} ({mlb_team}): {e}")
+        logger.error(f"MLBAM lookup error {name}: {e}")
     return None
 
 
-async def get_player_stats_for_date(mlbam_id: int, stat_date: str) -> dict:
-    """Get a player's stats for a specific date using MLB game log."""
-    result = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+async def fetch_player_stat_for_date(
+    mlbam_id: int, stat_type: str, score_date: str
+) -> int:
+    """Fetch a single player's stat for one date from MLB game log."""
+    year = score_date[:4]
+    group = "pitching" if stat_type == "k" else "hitting"
+    stat_key = {
+        "rbi": "rbi", "h": "hits", "hr": "homeRuns",
+        "sb": "stolenBases", "k": "strikeOuts"
+    }[stat_type]
+
+    url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+           f"?stats=gameLog&season={year}&group={group}"
+           f"&startDate={score_date}&endDate={score_date}")
     try:
-        year = stat_date[:4]
-        hit_url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
-                   f"?stats=gameLog&season={year}&group=hitting"
-                   f"&startDate={stat_date}&endDate={stat_date}")
         async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(hit_url)
+            resp = await c.get(url)
+        total = 0
         for sg in resp.json().get("stats", []):
             for split in sg.get("splits", []):
-                s = split.get("stat", {})
-                result["rbi"] += int(s.get("rbi", 0) or 0)
-                result["h"]   += int(s.get("hits", 0) or 0)
-                result["hr"]  += int(s.get("homeRuns", 0) or 0)
-                result["sb"]  += int(s.get("stolenBases", 0) or 0)
-        pit_url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
-                   f"?stats=gameLog&season={year}&group=pitching"
-                   f"&startDate={stat_date}&endDate={stat_date}")
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(pit_url)
-        for sg in resp.json().get("stats", []):
-            for split in sg.get("splits", []):
-                s = split.get("stat", {})
-                result["k"] += int(s.get("strikeOuts", 0) or 0)
+                total += int(split.get("stat", {}).get(stat_key, 0) or 0)
+        return total
     except Exception as e:
-        logger.error(f"Stats error for mlbam_id={mlbam_id} date={stat_date}: {e}")
-    return result
+        logger.error(f"MLB stat error mlbam={mlbam_id} {stat_type} {score_date}: {e}")
+        return 0
 
 
-async def get_mlb_stats(player_name: str, mlb_team: str = "") -> dict:
-    """Kept for compatibility — returns today's stats."""
-    empty = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
-    mlbam_id = await get_mlbam_id(player_name, mlb_team)
-    if not mlbam_id:
-        return empty
-    return await get_player_stats_for_date(mlbam_id, date.today().isoformat())
+# ─────────────────────────────────────────────
+# STEP 3 — Recompute monthly totals from stored data
+# ─────────────────────────────────────────────
 
-
-async def get_todays_games() -> list:
-    today = date.today().strftime("%Y-%m-%d")
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            resp = await c.get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=linescore,team,decisions")
-        return resp.json().get("dates", [{}])[0].get("games", [])
-    except:
-        return []
-
-
-async def fetch_mlb_scores() -> list:
-    games = await get_todays_games()
-    today = date.today().isoformat()
-    out = []
-    for g in games:
-        away = g["teams"]["away"]
-        home = g["teams"]["home"]
-        out.append({
-            "game_id": g["gamePk"], "status": g["status"]["abstractGameState"],
-            "status_detail": g["status"]["detailedState"],
-            "inning": g.get("linescore", {}).get("currentInningOrdinal", ""),
-            "away_team": away["team"]["name"], "away_abbr": away["team"].get("abbreviation", ""),
-            "away_score": away.get("score"), "away_winner": away.get("isWinner", False),
-            "home_team": home["team"]["name"], "home_abbr": home["team"].get("abbreviation", ""),
-            "home_score": home.get("score"), "home_winner": home.get("isWinner", False),
-            "venue": g.get("venue", {}).get("name", ""), "game_date": today,
-        })
-    return out
-
-
-async def fetch_mlb_news() -> list:
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            resp = await c.get("https://api.rss2json.com/v1/api.json?rss_url=https://www.mlb.com/feeds/news/rss.xml")
-        return [{"title": i.get("title",""), "link": i.get("link",""), "pub_date": i.get("pubDate",""), "description": (i.get("description","") or "")[:200]} for i in resp.json().get("items", [])[:12]]
-    except:
-        return []
-
-
-async def get_started_player_ids_fantraxapi() -> dict:
+def recompute_monthly_totals(month_str: str, stat_type: str) -> dict:
     """
-    Use fantraxapi library to get started (non-bench, non-IL) player IDs
-    for each team for today's scoring period.
-    Returns: {fantrax_player_id: fantasy_team_name}
+    Join daily_lineups (is_active=true) with daily_player_stats for the month.
+    Returns {fantasy_team: total_value}
     """
-    if not FANTRAXAPI_AVAILABLE:
-        logger.warning("fantraxapi not installed, skipping started filter")
-        return {}
-    try:
-        loop = asyncio.get_event_loop()
-        def _get_lineups():
-            api = FanTraxAPI(FANTRAX_LEAGUE_ID, username=FANTRAX_USERNAME, password=FANTRAX_PASSWORD)
-            league = api.league()
-            started = {}
-            today = date.today()
-            # Find today's scoring period number
-            period_num = None
-            for num, d in league.scoring_dates.items():
-                if d == today:
-                    period_num = num
-                    break
-            if period_num is None:
-                logger.warning(f"No scoring period found for {today}")
-                return {}
-            logger.info(f"Today's scoring period: {period_num}")
-            for team in league.teams:
-                try:
-                    roster = team.roster(period_num)
-                    for row in roster.rows:
-                        if row.player is None:
-                            continue
-                        pos = row.position.short_name if row.position else ""
-                        # Skip bench and IL slots
-                        if pos in ("BN", "IL", "IL+", "NA", "MINORS"):
-                            continue
-                        started[row.player.id] = team.name
-                except Exception as e:
-                    logger.error(f"Roster error for {team.name}: {e}")
-            logger.info(f"Started players found: {len(started)}")
-            return started
-        started = await loop.run_in_executor(None, _get_lineups)
-        return started
-    except Exception as e:
-        logger.error(f"fantraxapi lineup error: {e}")
+    if not supabase:
         return {}
 
+    year, mon = int(month_str[:4]), int(month_str[5:7])
+    last_day = calendar.monthrange(year, mon)[1]
+    month_start = f"{month_str}-01"
+    month_end = f"{month_str}-{last_day:02d}"
+
+    # Get all active lineup rows for the month
+    lineups = supabase.table("daily_lineups")\
+        .select("score_date,fantrax_player_id,fantasy_team")\
+        .eq("is_active", True)\
+        .gte("score_date", month_start)\
+        .lte("score_date", month_end)\
+        .execute().data
+
+    if not lineups:
+        return {t: 0 for t in TEAMS}
+
+    # Get all player stats for the month
+    stats = supabase.table("daily_player_stats")\
+        .select("score_date,fantrax_player_id,value")\
+        .eq("stat_type", stat_type)\
+        .gte("score_date", month_start)\
+        .lte("score_date", month_end)\
+        .execute().data
+
+    # Build lookup: (date, player_id) -> value
+    stat_lookup = {(r["score_date"], r["fantrax_player_id"]): r["value"] for r in stats}
+
+    # Sum: for each active lineup row, add stat value
+    totals = {t: 0 for t in TEAMS}
+    for row in lineups:
+        team = row["fantasy_team"]
+        if team not in totals:
+            continue
+        key = (row["score_date"], row["fantrax_player_id"])
+        totals[team] += stat_lookup.get(key, 0)
+
+    return totals
+
+
+# ─────────────────────────────────────────────
+# Main sync function
+# ─────────────────────────────────────────────
 
 async def run_fantrax_sync():
     global FANTRAX_LOGGED_IN
     if sync_state["syncing"]:
+        logger.info("Sync already running, skipping")
         return
     sync_state["syncing"] = True
     sync_state["status"] = "syncing"
@@ -304,260 +379,191 @@ async def run_fantrax_sync():
                 return
 
         today_str = date.today().isoformat()
-
-        # Determine which stat to track based on current month
-        month = date.today().month
-        if month in (3, 4):
-            active_stat = "rbi"
-        elif month == 5:
-            active_stat = "k"
-        elif month == 6:
-            active_stat = "h"
-        elif month == 7:
-            active_stat = "sb"
-        elif month == 8:
-            active_stat = "hr"
-        else:
-            active_stat = "rbi"
-        logger.info(f"Active stat: {active_stat}")
-
-        # Find all dates from league start to today that need processing
-        LEAGUE_START = date(2026, 3, 25)  # Opening Day
-        all_dates = []
-        d = LEAGUE_START
-        while d <= date.today():
-            all_dates.append(d.isoformat())
-            d = date.fromordinal(d.toordinal() + 1)
-
-        # Find which dates already have data in daily_stats
-        existing = supabase.table("daily_stats")            .select("stat_date")            .eq("stat_type", active_stat)            .execute().data if supabase else []
-        existing_dates = {row["stat_date"] for row in existing}
-
-        # Process missing dates + always reprocess today
-        dates_to_process = [d for d in all_dates if d not in existing_dates or d == today_str]
-        logger.info(f"Dates to process: {dates_to_process}")
-
-        # Clean up stale/invalid team names from previous syncs
-        if supabase:
-            valid_teams = TEAMS
-            all_team_rows = supabase.table("team_stats").select("team_name").execute().data
-            for row in all_team_rows:
-                if row["team_name"] not in valid_teams:
-                    logger.info(f"Deleting stale team_stats: {row['team_name']}")
-                    supabase.table("team_stats").delete().eq("team_name", row["team_name"]).execute()
-            for t in ["pinto!", "Designated Shitters 🧻", "Designated Shitters 🚽"]:
-                supabase.table("player_stats").delete().eq("fantasy_team", t).execute()
-
-        # Get today's started players via fantraxapi (bench/IL excluded)
-        started_map = await get_started_player_ids_fantraxapi()
-        use_started_filter = len(started_map) > 0
-        logger.info(f"Started filter active: {use_started_filter} ({len(started_map)} players)")
-
-        # Step 1: Rosters — who owns which player
-        roster_data = await fantrax_get(
-            "/fxea/general/getTeamRosters",
-            {"leagueId": FANTRAX_LEAGUE_ID}
-        )
-        player_team_map = {}   # fantrax_id -> team_name
-        player_status_map = {} # fantrax_id -> status
-
-        if roster_data and isinstance(roster_data.get("rosters"), dict):
-            for team_id, team_info in roster_data["rosters"].items():
-                if not isinstance(team_info, dict):
-                    continue
-                team_name = team_info.get("teamName", "Unknown")
-                for player in team_info.get("rosterItems", []):
-                    if not isinstance(player, dict):
-                        continue
-                    pid = str(player.get("id", ""))
-                    status = player.get("status", "ACTIVE").upper()
-                    if pid:
-                        player_team_map[pid] = team_name
-                        player_status_map[pid] = status
-            logger.info(f"Roster: {len(player_team_map)} players across 14 teams")
-            # Log a sample rosterItem to see all available fields
-            for team_id, team_info in roster_data["rosters"].items():
-                if isinstance(team_info, dict) and team_info.get("rosterItems"):
-                    sample = team_info["rosterItems"][0]
-                    logger.info(f"Sample rosterItem keys: {list(sample.keys())}")
-                    logger.info(f"Sample rosterItem: {sample}")
-                    break
-
-        # Step 2: getPlayerIds — real names, teams, positions (2GB RAM — no problem)
-        player_ids_data = await fantrax_get(
-            "/fxea/general/getPlayerIds",
-            {"sport": "MLB"}
-        )
-
-        rostered_ids = set(player_team_map.keys())
-        player_info_map = {}
-        if isinstance(player_ids_data, dict):
-            for pid, pdata in player_ids_data.items():
-                if str(pid) in rostered_ids and isinstance(pdata, dict):
-                    player_info_map[str(pid)] = pdata
-            logger.info(f"getPlayerIds: {len(player_info_map)} rostered players matched")
-        del player_ids_data  # free memory
-
-
-        # Step 3: For each missing date, fetch that day's stats for all rostered players
-        processed = 0
-        stats_calls = 0
-
-        for process_date in dates_to_process:
-            logger.info(f"Processing date: {process_date}")
-            team_totals = {t: 0 for t in TEAMS}
-            sample_logged = False
-
-            for fantrax_pid, fantasy_team_name in player_team_map.items():
-            # If we have started lineup data, only count started players
-            if use_started_filter and fantrax_pid not in started_map:
-                continue
-            # Otherwise fall back to filtering out known bench/IR statuses
-            if not use_started_filter:
-                status = player_status_map.get(fantrax_pid, "ACTIVE").upper()
-                if status in ("INJURED_RESERVE", "IL", "IR", "MINORS", "NA"):
-                    continue
-
-            # Exact match first, then normalize apostrophes/quotes
-            matched_team = None
-            if fantasy_team_name in TEAMS:
-                matched_team = fantasy_team_name
-            else:
-                # Normalize curly/straight apostrophes for comparison
-                def norm(s):
-                    return s.replace('’', "'").replace('‘', "'").lower()
-                for t in TEAMS:
-                    if norm(t) == norm(fantasy_team_name):
-                        matched_team = t
-                        break
-            if not matched_team:
-                logger.warning(f"No team match for: '{fantasy_team_name}'")
-                continue
-
-            pinfo = player_info_map.get(fantrax_pid, {})
-            raw_name = pinfo.get("name", "")
-            if raw_name and "," in raw_name:
-                parts = raw_name.split(",", 1)
-                name = f"{parts[1].strip()} {parts[0].strip()}"
-            else:
-                name = raw_name or fantrax_pid
-
-            mlb_team = pinfo.get("team", "")
-            position = pinfo.get("position", "")
-
-            # Get this date's stats for this player
-            stat_value = 0
-            if name and name != fantrax_pid:
-                mlbam_id = await get_mlbam_id(name, mlb_team)
-                if mlbam_id:
-                    day_stats = await get_player_stats_for_date(mlbam_id, process_date)
-                    stat_value = day_stats.get(active_stat, 0)
-                    stats_calls += 1
-
-            team_totals[matched_team] += stat_value
-
-            if not sample_logged and stat_value > 0:
-                logger.info(f"  {process_date} {name} {active_stat}={stat_value} ({matched_team})")
-                sample_logged = True
-
-            processed += 1
-
-            # Update player_stats leaderboard for today only
-            if process_date == today_str and supabase:
-                supabase.table("player_stats").upsert({
-                    "player_id": fantrax_pid, "name": name,
-                    "mlb_team": mlb_team, "position": position,
-                    "fantasy_team": matched_team,
-                    "rbi": stat_value if active_stat == "rbi" else 0,
-                    "k":   stat_value if active_stat == "k"   else 0,
-                    "h":   stat_value if active_stat == "h"   else 0,
-                    "sb":  stat_value if active_stat == "sb"  else 0,
-                    "hr":  stat_value if active_stat == "hr"  else 0,
-                    "updated_at": today_str,
-                }, on_conflict="player_id").execute()
-
-        # Save this date's team totals to daily_stats
-        if supabase:
-            for team_name, day_value in team_totals.items():
-                supabase.table("daily_stats").upsert({
-                    "stat_date": process_date,
-                    "fantasy_team": team_name,
-                    "stat_type": active_stat,
-                    "value": int(day_value),
-                    "updated_at": today_str
-                }, on_conflict="stat_date,fantasy_team,stat_type").execute()
-            logger.info(f"  Saved {process_date}: {dict(list(team_totals.items())[:3])}...")
-
-        # End of date loop - recompute monthly totals from all daily_stats
-        import calendar
+        today_month = date.today().month
+        stat_type = active_stat_for_month(today_month)
         month_str = today_str[:7]
-        year, mon = int(month_str[:4]), int(month_str[5:7])
-        last_day = calendar.monthrange(year, mon)[1]
-        if supabase:
-            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .gte("stat_date", f"{month_str}-01")                .lte("stat_date", f"{month_str}-{last_day:02d}")                .eq("stat_type", active_stat)                .execute().data
-            monthly_totals = {t: 0 for t in TEAMS}
-            for row in all_daily:
-                t = row["fantasy_team"]
-                if t in monthly_totals:
-                    monthly_totals[t] += row["value"]
-            stat_col = {"rbi": "rbi", "k": "strikeouts", "h": "hits",
-                        "sb": "stolen_bases", "hr": "home_runs"}[active_stat]
-            for team_name, total in monthly_totals.items():
-                supabase.table("team_stats").upsert({
-                    "team_name": team_name, "season": 2026,
-                    stat_col: total, "updated_at": today_str
-                }, on_conflict="team_name,season").execute()
-            logger.info(f"Monthly totals written. Top: {sorted(monthly_totals.items(), key=lambda x: -x[1])[:3]}")
 
-        # Step 4: Write daily_stats rows (one per team per day)
-        # Then recompute team_stats as sum of all daily_stats for the month
+        logger.info(f"Sync date: {today_str} | Active stat: {stat_type}")
+
+        # ── STEP 1: Fetch lineups ──
+        lineup_rows = await fetch_lineups_for_date(today_str)
+        if not lineup_rows:
+            logger.error("No lineup data returned — aborting sync")
+            sync_state["status"] = "error"
+            return
+
+        # Store scoring_day
         if supabase:
-            month_str = today_str[:7]  # e.g. "2026-03"
-            for team_name, day_value in team_totals.items():
-                # Upsert today's daily row
-                supabase.table("daily_stats").upsert({
-                    "stat_date": today_str,
+            supabase.table("scoring_days").upsert({
+                "score_date": today_str,
+                "season": 2026,
+                "processed": False,
+                "updated_at": today_str,
+            }, on_conflict="score_date").execute()
+
+        # Store daily_lineups (upsert so rerun is safe)
+        if supabase:
+            supabase.table("daily_lineups").upsert(
+                lineup_rows,
+                on_conflict="score_date,fantasy_team,fantrax_player_id"
+            ).execute()
+            logger.info(f"Stored {len(lineup_rows)} lineup rows for {today_str}")
+
+        # ── STEP 2: Fetch stats for active players only ──
+        active_rows = [r for r in lineup_rows if r["is_active"]]
+        logger.info(f"Fetching {stat_type} for {len(active_rows)} active players...")
+
+        stat_rows = []
+        api_calls = 0
+
+        for row in active_rows:
+            name = row["player_name"]
+            mlb_team = row["mlb_team"]
+            pid = row["fantrax_player_id"]
+
+            if not name or name == pid:
+                continue
+
+            mlbam_id = await get_mlbam_id(name, mlb_team)
+            if not mlbam_id:
+                continue
+
+            value = await fetch_player_stat_for_date(mlbam_id, stat_type, today_str)
+            api_calls += 1
+
+            stat_rows.append({
+                "score_date": today_str,
+                "fantrax_player_id": pid,
+                "player_name": name,
+                "stat_type": stat_type,
+                "value": value,
+                "updated_at": today_str,
+            })
+
+            if value > 0:
+                logger.info(f"  {name} ({mlb_team}): {stat_type}={value}")
+
+        logger.info(f"Stats fetched: {api_calls} API calls, "
+                    f"{sum(r['value'] for r in stat_rows)} total {stat_type}")
+
+        # Store daily_player_stats
+        if supabase and stat_rows:
+            supabase.table("daily_player_stats").upsert(
+                stat_rows,
+                on_conflict="score_date,fantrax_player_id,stat_type"
+            ).execute()
+
+        # Mark scoring day processed
+        if supabase:
+            supabase.table("scoring_days").upsert({
+                "score_date": today_str,
+                "season": 2026,
+                "processed": True,
+                "updated_at": today_str,
+            }, on_conflict="score_date").execute()
+
+        # ── STEP 3: Recompute monthly totals from source data ──
+        logger.info(f"Recomputing monthly totals for {month_str}...")
+        totals = recompute_monthly_totals(month_str, stat_type)
+
+        stat_col = {"rbi": "rbi", "k": "strikeouts", "h": "hits",
+                    "sb": "stolen_bases", "hr": "home_runs"}[stat_type]
+
+        if supabase:
+            for team_name, total in totals.items():
+                # Write to monthly_totals (auditable)
+                supabase.table("monthly_totals").upsert({
+                    "month": month_str,
                     "fantasy_team": team_name,
-                    "stat_type": active_stat,
-                    "value": int(day_value),
-                    "updated_at": today_str
-                }, on_conflict="stat_date,fantasy_team,stat_type").execute()
+                    "stat_type": stat_type,
+                    "total": total,
+                    "updated_at": today_str,
+                }, on_conflict="month,fantasy_team,stat_type").execute()
 
-            # Recompute monthly totals from daily_stats
-            # Use gte/lte instead of like — stat_date is a DATE column
-            import calendar
-            year, mon = int(month_str[:4]), int(month_str[5:7])
-            last_day = calendar.monthrange(year, mon)[1]
-            month_start = f"{month_str}-01"
-            month_end = f"{month_str}-{last_day:02d}"
-            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .gte("stat_date", month_start)                .lte("stat_date", month_end)                .eq("stat_type", active_stat)                .execute().data
-
-            monthly_totals = {t: 0 for t in TEAMS}
-            for row in all_daily:
-                t = row["fantasy_team"]
-                if t in monthly_totals:
-                    monthly_totals[t] += row["value"]
-
-            # Write to team_stats for display
-            stat_col = {"rbi": "rbi", "k": "strikeouts", "h": "hits",
-                        "sb": "stolen_bases", "hr": "home_runs"}[active_stat]
-            for team_name, total in monthly_totals.items():
+                # Write to team_stats (frontend display)
                 supabase.table("team_stats").upsert({
-                    "team_name": team_name, "season": 2026,
-                    stat_col: total, "updated_at": today_str
+                    "team_name": team_name,
+                    "season": 2026,
+                    stat_col: total,
+                    "updated_at": today_str,
                 }, on_conflict="team_name,season").execute()
 
         now_et = datetime.now(ET).strftime("%b %d %I:%M %p ET")
         sync_state["last_sync_date"] = today_str
         sync_state["last_sync_time"] = now_et
         sync_state["status"] = "done"
-        logger.info(f"Sync complete: {processed} players, {stats_calls} MLB API calls [{now_et}]")
+
+        top = sorted(totals.items(), key=lambda x: -x[1])[:3]
+        logger.info(f"Sync complete [{now_et}] | Top 3: {top}")
 
     except Exception as e:
         logger.error(f"Sync error: {e}", exc_info=True)
         sync_state["status"] = "error"
     finally:
         sync_state["syncing"] = False
+
+
+# ─────────────────────────────────────────────
+# MLB scores + news helpers
+# ─────────────────────────────────────────────
+
+async def get_todays_games() -> list:
+    today = date.today().strftime("%Y-%m-%d")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                f"https://statsapi.mlb.com/api/v1/schedule"
+                f"?sportId=1&date={today}&hydrate=linescore,team,decisions"
+            )
+        return resp.json().get("dates", [{}])[0].get("games", [])
+    except:
+        return []
+
+
+async def fetch_mlb_scores() -> list:
+    games = await get_todays_games()
+    today = date.today().isoformat()
+    out = []
+    for g in games:
+        away = g["teams"]["away"]
+        home = g["teams"]["home"]
+        out.append({
+            "game_id": g["gamePk"],
+            "status": g["status"]["abstractGameState"],
+            "status_detail": g["status"]["detailedState"],
+            "inning": g.get("linescore", {}).get("currentInningOrdinal", ""),
+            "away_team": away["team"]["name"],
+            "away_abbr": away["team"].get("abbreviation", ""),
+            "away_score": away.get("score"),
+            "away_winner": away.get("isWinner", False),
+            "home_team": home["team"]["name"],
+            "home_abbr": home["team"].get("abbreviation", ""),
+            "home_score": home.get("score"),
+            "home_winner": home.get("isWinner", False),
+            "venue": g.get("venue", {}).get("name", ""),
+            "game_date": today,
+        })
+    return out
+
+
+async def fetch_mlb_news() -> list:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://api.rss2json.com/v1/api.json"
+                "?rss_url=https://www.mlb.com/feeds/news/rss.xml"
+            )
+        return [
+            {
+                "title": i.get("title", ""),
+                "link": i.get("link", ""),
+                "pub_date": i.get("pubDate", ""),
+                "description": (i.get("description", "") or "")[:200]
+            }
+            for i in resp.json().get("items", [])[:12]
+        ]
+    except:
+        return []
 
 
 async def cache_mlb_scores():
@@ -571,21 +577,24 @@ async def cache_mlb_scores():
 
 
 async def check_and_sync():
-    today_str = date.today().isoformat()
     await cache_mlb_scores()
-    if sync_state["last_sync_date"] == today_str:
-        return
     games = await get_todays_games()
     if not games:
-        sync_state["last_sync_date"] = today_str
         return
-    non_final = [g for g in games if g["status"]["abstractGameState"] not in ("Final","Postponed","Cancelled")]
+    non_final = [
+        g for g in games
+        if g["status"]["abstractGameState"] not in ("Final", "Postponed", "Cancelled")
+    ]
     if not non_final:
         await run_fantrax_sync()
     else:
         live = sum(1 for g in games if g["status"]["abstractGameState"] == "Live")
-        logger.info(f"{live} games live — waiting")
+        logger.info(f"{live} games live, {len(non_final)} not final — waiting")
 
+
+# ─────────────────────────────────────────────
+# Startup / shutdown
+# ─────────────────────────────────────────────
 
 scheduler = AsyncIOScheduler(timezone="America/New_York")
 
@@ -598,8 +607,8 @@ async def startup():
         logger.info("Supabase connected")
     if FANTRAX_USERNAME and FANTRAX_PASSWORD:
         await fantrax_login()
-    scheduler.add_job(check_and_sync, "cron", hour="22-23,0,1,2", minute="0,30")
-    scheduler.add_job(cache_mlb_scores, "cron", hour="13-21", minute="0,30")
+    scheduler.add_job(check_and_sync, "cron", hour="22,23,0,1,2", minute="0,30")
+    scheduler.add_job(cache_mlb_scores, "cron", hour="13-21", minute="0,15,30,45")
     scheduler.start()
     logger.info("SeanBot 1.0 online")
 
@@ -608,6 +617,10 @@ async def startup():
 async def shutdown():
     scheduler.shutdown()
 
+
+# ─────────────────────────────────────────────
+# API endpoints
+# ─────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -628,23 +641,6 @@ async def get_status():
     }
 
 
-@app.get("/api/daily-stats")
-async def get_daily_stats(month: str = None):
-    """Return monthly cumulative stats from daily_stats table."""
-    if not supabase:
-        raise HTTPException(503, "DB not configured")
-    if not month:
-        month = date.today().isoformat()[:7]  # e.g. "2026-03"
-    rows = supabase.table("daily_stats")        .select("fantasy_team,stat_type,value,stat_date")        .like("stat_date", f"{month}%")        .execute().data
-    # Sum by team
-    totals = {t: 0 for t in TEAMS}
-    for row in rows:
-        t = row["fantasy_team"]
-        if t in totals:
-            totals[t] += row["value"]
-    return {"month": month, "data": [{"team": t, "total": v} for t, v in sorted(totals.items(), key=lambda x: -x[1])]}
-
-
 @app.get("/api/team-stats")
 async def get_team_stats(season: int = 2026):
     if not supabase:
@@ -652,13 +648,104 @@ async def get_team_stats(season: int = 2026):
     return {"data": supabase.table("team_stats").select("*").eq("season", season).execute().data}
 
 
+@app.get("/api/monthly-totals")
+async def get_monthly_totals(month: str = None):
+    """Return monthly leaderboard from monthly_totals table (auditable source)."""
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    if not month:
+        month = date.today().isoformat()[:7]
+    stat_type = active_stat_for_month(int(month[5:7]))
+    rows = supabase.table("monthly_totals")\
+        .select("fantasy_team,total,stat_type")\
+        .eq("month", month)\
+        .eq("stat_type", stat_type)\
+        .order("total", desc=True)\
+        .execute().data
+    return {"month": month, "stat_type": stat_type, "data": rows}
+
+
+@app.get("/api/daily-breakdown")
+async def get_daily_breakdown(team: str, date_str: str = None):
+    """
+    Commissioner view: show which active players contributed stats
+    for a given team on a given date.
+    """
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    if not date_str:
+        date_str = date.today().isoformat()
+    stat_type = active_stat_for_month(int(date_str[5:7]))
+
+    # Get active players for this team on this date
+    lineups = supabase.table("daily_lineups")\
+        .select("fantrax_player_id,player_name,slot,is_active")\
+        .eq("score_date", date_str)\
+        .eq("fantasy_team", team)\
+        .execute().data
+
+    # Get stats for those players on that date
+    pids = [r["fantrax_player_id"] for r in lineups]
+    stats_map = {}
+    if pids:
+        stats = supabase.table("daily_player_stats")\
+            .select("fantrax_player_id,value")\
+            .eq("score_date", date_str)\
+            .eq("stat_type", stat_type)\
+            .in_("fantrax_player_id", pids)\
+            .execute().data
+        stats_map = {r["fantrax_player_id"]: r["value"] for r in stats}
+
+    result = []
+    for p in lineups:
+        result.append({
+            "player": p["player_name"],
+            "slot": p["slot"],
+            "is_active": p["is_active"],
+            "stat_type": stat_type,
+            "value": stats_map.get(p["fantrax_player_id"], 0),
+        })
+    result.sort(key=lambda x: (-x["value"], not x["is_active"]))
+
+    total = sum(r["value"] for r in result if r["is_active"])
+    return {
+        "team": team, "date": date_str,
+        "stat_type": stat_type, "total": total,
+        "players": result
+    }
+
+
 @app.get("/api/player-leaders/{stat}")
 async def get_player_leaders(stat: str, limit: int = 10):
-    if stat not in ["rbi","k","h","sb","hr"]:
+    if stat not in ["rbi", "k", "h", "sb", "hr"]:
         raise HTTPException(400, "Invalid stat")
     if not supabase:
         raise HTTPException(503, "DB not configured")
-    return {"data": supabase.table("player_stats").select("*").order(stat, desc=True).limit(limit).execute().data}
+    # Pull from daily_player_stats for current month, sum by player
+    month_str = date.today().isoformat()[:7]
+    stat_type = active_stat_for_month(date.today().month)
+    year, mon = int(month_str[:4]), int(month_str[5:7])
+    last_day = calendar.monthrange(year, mon)[1]
+    month_start = f"{month_str}-01"
+    month_end = f"{month_str}-{last_day:02d}"
+
+    rows = supabase.table("daily_player_stats")\
+        .select("fantrax_player_id,player_name,value")\
+        .eq("stat_type", stat_type)\
+        .gte("score_date", month_start)\
+        .lte("score_date", month_end)\
+        .execute().data
+
+    # Sum by player
+    player_totals: dict = {}
+    for r in rows:
+        pid = r["fantrax_player_id"]
+        if pid not in player_totals:
+            player_totals[pid] = {"name": r["player_name"], "value": 0}
+        player_totals[pid]["value"] += r["value"]
+
+    sorted_players = sorted(player_totals.values(), key=lambda x: -x["value"])[:limit]
+    return {"data": sorted_players}
 
 
 @app.get("/api/mlb-scores")
@@ -680,7 +767,10 @@ async def get_mlb_news():
 async def get_chirps(limit: int = 50):
     if not supabase:
         raise HTTPException(503, "DB not configured")
-    return {"data": supabase.table("chirps").select("*").order("created_at", desc=True).limit(limit).execute().data}
+    return {
+        "data": supabase.table("chirps").select("*")
+        .order("created_at", desc=True).limit(limit).execute().data
+    }
 
 
 @app.post("/api/chirps")
@@ -692,15 +782,23 @@ async def post_chirp(request: Request):
     message = (body.get("message") or "")[:280]
     team    = (body.get("team")    or "")[:60]
     if not message.strip():
-        raise HTTPException(400, "Empty")
-    return {"ok": True, "data": supabase.table("chirps").insert({"author": author, "team": team, "message": message}).execute().data}
+        raise HTTPException(400, "Empty message")
+    return {
+        "ok": True,
+        "data": supabase.table("chirps").insert(
+            {"author": author, "team": team, "message": message}
+        ).execute().data
+    }
 
 
 @app.get("/api/history")
 async def get_history():
     if not supabase:
         raise HTTPException(503, "DB not configured")
-    return {"data": supabase.table("prize_history").select("*").order("year", desc=True).execute().data}
+    return {
+        "data": supabase.table("prize_history").select("*")
+        .order("year", desc=True).execute().data
+    }
 
 
 @app.post("/api/history")
@@ -710,8 +808,19 @@ async def save_history(request: Request):
         raise HTTPException(403, "Unauthorized")
     if not supabase:
         raise HTTPException(503, "DB not configured")
-    record = {"year": int(body["year"]), "cat_idx": int(body["cat_idx"]), "cat_name": body["cat_name"], "period": body["period"], "winner_team": body["winner_team"], "total": int(body["total"])}
-    return {"ok": True, "data": supabase.table("prize_history").upsert(record, on_conflict="year,cat_idx").execute().data}
+    record = {
+        "year": int(body["year"]),
+        "cat_idx": int(body["cat_idx"]),
+        "cat_name": body["cat_name"],
+        "period": body["period"],
+        "winner_team": body["winner_team"],
+        "total": int(body["total"])
+    }
+    return {
+        "ok": True,
+        "data": supabase.table("prize_history")
+        .upsert(record, on_conflict="year,cat_idx").execute().data
+    }
 
 
 @app.post("/api/sync-now")
@@ -720,17 +829,21 @@ async def trigger_sync(request: Request):
     body = await request.json()
     if body.get("secret") != ADMIN_SECRET:
         raise HTTPException(403, "Unauthorized")
+
+    # Manual stat override
     override = body.get("team_override")
     if override and supabase:
         team = override.get("team")
         stat = override.get("stat")
         val  = int(override.get("value", 0))
-        if stat in {"rbi","strikeouts","hits","stolen_bases","home_runs"} and team:
+        if stat in {"rbi", "strikeouts", "hits", "stolen_bases", "home_runs"} and team:
             supabase.table("team_stats").upsert(
-                {"team_name": team, "season": 2026, stat: val, "updated_at": date.today().isoformat()},
+                {"team_name": team, "season": 2026, stat: val,
+                 "updated_at": date.today().isoformat()},
                 on_conflict="team_name,season"
             ).execute()
             return {"ok": True, "message": f"Override: {team} {stat}={val}"}
+
     sync_state["last_sync_date"] = None
     FANTRAX_LOGGED_IN = False
     asyncio.create_task(run_fantrax_sync())
