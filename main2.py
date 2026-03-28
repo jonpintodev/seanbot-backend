@@ -592,8 +592,13 @@ async def post_manual_entry(request: Request):
            "value":value,"source":"manual","note":note,"entered_at":datetime.now(ET).isoformat()}
     supabase.table("manual_score_entries").upsert(row,on_conflict="score_date,fantasy_team,stat_type").execute()
 
+    # Verify what's now in manual_score_entries for this month
+    all_manual = supabase.table("manual_score_entries").select("score_date,fantasy_team,value")         .eq("stat_type", stat_type).gte("score_date", f"{score_date[:7]}-01").execute().data
+    logger.info(f"All manual entries for {score_date[:7]}: {all_manual}")
+
     month_str = score_date[:7]
     totals    = recompute_monthly_totals(month_str, stat_type)
+    logger.info(f"Recomputed totals after saving {fantasy_team} {score_date}: { {t:v for t,v in totals.items() if v > 0} }")
     stat_col  = {"rbi":"rbi","k":"strikeouts","h":"hits","sb":"stolen_bases","hr":"home_runs"}[stat_type]
     today_str = date.today().isoformat()
     for team_name, total in totals.items():
