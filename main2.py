@@ -33,9 +33,9 @@ ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "changeme123")
 
 supabase: Optional[Client] = None
 TEAMS = [
-    "Possibilities", "Yoshi's Islanders", "thebigfur", "Red Birds",
+    "Possibilities", "Yoshi’s Islanders", "thebigfur", "Red Birds",
     "Daddy Yankee", "¡pinto!", "JoanMacias", "Xavier", "Los Jankees",
-    "Momin8241", "ericliaci", "Sho Me The Money",
+    "Momin8421", "ericliaci", "Sho Me The Money",
     "Designated Shitters 🚽", "Arraezed & Hoerny"
 ]
 sync_state = {"last_sync_date": None, "syncing": False, "last_sync_time": None, "status": "idle"}
@@ -94,25 +94,45 @@ async def fantrax_get(path: str, params: dict = None) -> Optional[dict]:
 MLBAM_ID_CACHE: dict = {}
 
 async def get_mlbam_id(name: str) -> Optional[int]:
-    """Search MLB Stats API by name to get MLBAM player ID."""
+    """Search MLB Stats API by full name to get MLBAM player ID."""
     if name in MLBAM_ID_CACHE:
         return MLBAM_ID_CACHE[name]
     try:
-        # Search by last name first
-        last = name.split()[-1] if name else ""
+        # Search by last name
+        parts = name.strip().split()
+        last = parts[-1] if parts else ""
+        first = parts[0] if len(parts) > 1 else ""
         url = f"https://statsapi.mlb.com/api/v1/people/search?names={last}&sportId=1"
         async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(url)
         people = resp.json().get("people", [])
-        # Find best match
         name_lower = name.lower()
+        # Priority 1: exact full name match
         for p in people:
-            full = p.get("fullName", "").lower()
-            if full == name_lower or name_lower in full or full in name_lower:
+            if p.get("fullName", "").lower() == name_lower:
                 mlbam_id = p.get("id")
                 if mlbam_id:
                     MLBAM_ID_CACHE[name] = mlbam_id
                     return mlbam_id
+        # Priority 2: first + last name both present
+        if first:
+            for p in people:
+                full = p.get("fullName", "").lower()
+                if first.lower() in full and last.lower() in full:
+                    mlbam_id = p.get("id")
+                    if mlbam_id:
+                        MLBAM_ID_CACHE[name] = mlbam_id
+                        return mlbam_id
+        # Priority 3: active players only (useCurrent=true)
+        url2 = f"https://statsapi.mlb.com/api/v1/people/search?names={last}&sportId=1&active=true"
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp2 = await c.get(url2)
+        people2 = resp2.json().get("people", [])
+        if len(people2) == 1:
+            mlbam_id = people2[0].get("id")
+            if mlbam_id:
+                MLBAM_ID_CACHE[name] = mlbam_id
+                return mlbam_id
     except Exception as e:
         logger.error(f"MLBAM lookup error for {name}: {e}")
     return None
@@ -205,6 +225,21 @@ async def run_fantrax_sync():
 
         today_str = date.today().isoformat()
 
+        # Clean up stale/invalid team names from previous syncs
+        if supabase:
+            valid_teams = TEAMS
+            # Delete team_stats rows not in valid list
+            all_team_rows = supabase.table("team_stats").select("team_name").execute().data
+            for row in all_team_rows:
+                if row["team_name"] not in valid_teams:
+                    logger.info(f"Deleting stale team_stats: {row['team_name']}")
+                    supabase.table("team_stats").delete().eq("team_name", row["team_name"]).execute()
+            # Delete player_stats rows with invalid fantasy_team
+            # (do in batches to avoid timeout)
+            for t in ["pinto!", "Designated Shitters", "Designated Shitters 🚽"]:
+                supabase.table("player_stats").delete().eq("fantasy_team", t).execute()
+                logger.info(f"Cleaned player_stats for: {t}")
+
         # Step 1: Rosters — who owns which player
         roster_data = await fantrax_get(
             "/fxea/general/getTeamRosters",
@@ -255,13 +290,16 @@ async def run_fantrax_sync():
             if status == "INJURED_RESERVE":
                 continue
 
-            # Exact match first, then case-insensitive exact match
+            # Exact match first, then normalize apostrophes/quotes
             matched_team = None
             if fantasy_team_name in TEAMS:
                 matched_team = fantasy_team_name
             else:
+                # Normalize curly/straight apostrophes for comparison
+                def norm(s):
+                    return s.replace('’', "'").replace('‘', "'").lower()
                 for t in TEAMS:
-                    if t.lower() == fantasy_team_name.lower():
+                    if norm(t) == norm(fantasy_team_name):
                         matched_team = t
                         break
             if not matched_team:
@@ -283,6 +321,14 @@ async def run_fantrax_sync():
             if name and name != fantrax_pid:
                 stats = await get_mlb_stats(name)
                 stats_calls += 1
+                # Zero out stats not needed this month to keep totals clean
+                import datetime
+                m = datetime.date.today().month
+                if m not in (3, 4):  stats["rbi"] = 0
+                if m != 5:           stats["k"] = 0
+                if m != 6:           stats["h"] = 0
+                if m != 7:           stats["sb"] = 0
+                if m != 8:           stats["hr"] = 0
 
             rbi = float(stats["rbi"])
             h   = float(stats["h"])
