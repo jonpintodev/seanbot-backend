@@ -228,21 +228,54 @@ async def run_fantrax_sync():
                         player_status_map[pid] = status
             logger.info(f"Roster: {len(player_team_map)} players across 14 teams")
 
-        # Step 2: getPlayerIds — only keep rostered players to save memory
-        player_ids_data = await fantrax_get(
-            "/fxea/general/getPlayerIds",
-            {"sport": "MLB"}
-        )
+        # Step 2: Get names from getLeagueInfo playerInfo (compact, league players only)
+        player_name_map = {}
+        player_pos_map = {}
+        player_mlbteam_map = {}
 
-        # Only store info for rostered players — don't hold 10k entries in RAM
-        rostered_ids = set(player_team_map.keys())
-        player_info_map = {}
-        if isinstance(player_ids_data, dict):
-            for pid, pdata in player_ids_data.items():
-                if str(pid) in rostered_ids and isinstance(pdata, dict):
-                    player_info_map[str(pid)] = pdata
-            logger.info(f"getPlayerIds: {len(player_info_map)} rostered players matched")
-        del player_ids_data  # free memory immediately
+        # First try names from roster rosterItems
+        if roster_data and isinstance(roster_data.get("rosters"), dict):
+            for team_id, team_info in roster_data["rosters"].items():
+                if not isinstance(team_info, dict):
+                    continue
+                for player in team_info.get("rosterItems", []):
+                    if not isinstance(player, dict):
+                        continue
+                    pid = str(player.get("id", ""))
+                    name = player.get("name") or player.get("playerName") or player.get("fullName") or ""
+                    pos = player.get("position") or player.get("pos") or ""
+                    team = player.get("proTeam") or player.get("team") or ""
+                    if pid:
+                        player_name_map[pid] = name
+                        player_pos_map[pid] = pos
+                        player_mlbteam_map[pid] = team
+        del roster_data
+
+        names_found = sum(1 for n in player_name_map.values() if n)
+        logger.info(f"Names from roster: {names_found}/{len(player_name_map)}")
+
+        if names_found < len(player_team_map) * 0.5:
+            league_data = await fantrax_get(
+                "/fxea/general/getLeagueInfo",
+                {"leagueId": FANTRAX_LEAGUE_ID}
+            )
+            if league_data:
+                player_info = league_data.get("playerInfo") or {}
+                for pid, pdata in player_info.items():
+                    if not isinstance(pdata, dict):
+                        continue
+                    name = pdata.get("name") or pdata.get("fn") or ""
+                    pos = pdata.get("pos") or pdata.get("position") or ""
+                    if pid and name:
+                        player_name_map[str(pid)] = name
+                        if pos:
+                            player_pos_map[str(pid)] = pos
+                del league_data
+            names_found = sum(1 for n in player_name_map.values() if n)
+            logger.info(f"Names after getLeagueInfo: {names_found}")
+
+        # Replace player_info_map references
+        player_info_map = {pid: {"name": player_name_map.get(pid,""), "team": player_mlbteam_map.get(pid,""), "position": player_pos_map.get(pid,"")} for pid in player_team_map}
 
         # Step 3: Process each player, write to Supabase immediately (no big list in RAM)
         team_totals = {t: {"rbi":0.0,"strikeouts":0.0,"hits":0.0,"stolen_bases":0.0,"home_runs":0.0} for t in TEAMS}
