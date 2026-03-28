@@ -36,7 +36,7 @@ TEAMS = [
     "Possibilities", "Yoshi’s Islanders", "thebigfur", "Red Birds",
     "Daddy Yankee", "¡pinto!", "JoanMacias", "Xavier", "Los Jankees",
     "Momin8421", "ericliaci", "Sho Me The Money",
-    "Designated Shitters 🚽", "Arraezed & Hoerny"
+    "Designated Shitters", "Arraezed & Hoerny"
 ]
 sync_state = {"last_sync_date": None, "syncing": False, "last_sync_time": None, "status": "idle"}
 COOKIES = {}
@@ -252,7 +252,7 @@ async def run_fantrax_sync():
                     supabase.table("team_stats").delete().eq("team_name", row["team_name"]).execute()
             # Delete player_stats rows with invalid fantasy_team
             # (do in batches to avoid timeout)
-            for t in ["pinto!", "Designated Shitters", "Designated Shitters 🚽"]:
+            for t in ["pinto!", "Designated Shitters", "Designated Shitters 🧻"]:
                 supabase.table("player_stats").delete().eq("fantasy_team", t).execute()
                 logger.info(f"Cleaned player_stats for: {t}")
 
@@ -278,6 +278,13 @@ async def run_fantrax_sync():
                         player_team_map[pid] = team_name
                         player_status_map[pid] = status
             logger.info(f"Roster: {len(player_team_map)} players across 14 teams")
+            # Log a sample rosterItem to see all available fields
+            for team_id, team_info in roster_data["rosters"].items():
+                if isinstance(team_info, dict) and team_info.get("rosterItems"):
+                    sample = team_info["rosterItems"][0]
+                    logger.info(f"Sample rosterItem keys: {list(sample.keys())}")
+                    logger.info(f"Sample rosterItem: {sample}")
+                    break
 
         # Step 2: getPlayerIds — real names, teams, positions (2GB RAM — no problem)
         player_ids_data = await fantrax_get(
