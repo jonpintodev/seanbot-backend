@@ -502,4 +502,3 @@ async def trigger_sync(request: Request):
     sync_state["last_sync_date"] = None
     asyncio.create_task(run_fantrax_sync())
     return {"ok": True, "message": "Fantrax sync triggered"}
-
