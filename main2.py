@@ -352,7 +352,6 @@ async def save_day(request: Request):
                 "team_name":  team,
                 "stat":       stat,
                 "value":      value,
-                "note":       note,
                 "updated_at": today,
             },
             on_conflict="score_date,team_name,stat"
