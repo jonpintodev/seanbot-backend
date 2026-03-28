@@ -170,7 +170,19 @@ class FantraxClient:
             f"{self.BASE}/fxea/general/getTeamRosters",
             params={"leagueId": FANTRAX_LEAGUE_ID}
         )
-        return resp.json() if resp.status_code == 200 else None
+        if resp.status_code != 200:
+            logger.error(f"getTeamRosters HTTP {resp.status_code}")
+            return None
+        try:
+            data = resp.json()
+            # Fantrax sometimes wraps response in a string — unwrap it
+            if isinstance(data, str):
+                import json
+                data = json.loads(data)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.error(f"getTeamRosters parse error: {e} | body: {resp.text[:300]}")
+            return None
 
     async def get_player_stats(self) -> Optional[dict]:
         resp = await self.session.post(
@@ -185,7 +197,18 @@ class FantraxClient:
                 "scoringCategory": "BASEBALL_HITTER",
             }
         )
-        return resp.json() if resp.status_code == 200 else None
+        if resp.status_code != 200:
+            logger.error(f"getPlayerStats HTTP {resp.status_code}")
+            return None
+        try:
+            data = resp.json()
+            if isinstance(data, str):
+                import json
+                data = json.loads(data)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.error(f"getPlayerStats parse error: {e} | body: {resp.text[:300]}")
+            return None
 
     async def close(self):
         await self.session.aclose()
@@ -219,14 +242,28 @@ async def run_fantrax_sync():
         player_team_map: dict[str, str] = {}
 
         if rosters_data:
-            for team_info in rosters_data.get("rosters", []):
-                team_name = team_info.get("name", "Unknown")
-                for player in team_info.get("rosterItems", []):
+            logger.info(f"Roster keys: {list(rosters_data.keys())[:10]}")
+            roster_list = (rosters_data.get("rosters") or
+                           rosters_data.get("rosterItems") or
+                           rosters_data.get("teams") or [])
+            for team_info in roster_list:
+                if not isinstance(team_info, dict):
+                    continue
+                team_name = (team_info.get("name") or
+                             team_info.get("teamName") or "Unknown")
+                players = (team_info.get("rosterItems") or
+                           team_info.get("players") or
+                           team_info.get("roster") or [])
+                for player in players:
+                    if not isinstance(player, dict):
+                        continue
                     slot = player.get("lineupStatus", "").upper()
-                    pid = player.get("id", "")
+                    pid = str(player.get("id") or player.get("playerId") or "")
                     if pid and slot not in ("BN", "IL", "NA", "SUSP"):
                         starter_ids.add(pid)
                         player_team_map[pid] = team_name
+        else:
+            logger.warning("No roster data — counting all players")
 
         logger.info(f"Starters found: {len(starter_ids)}")
 
@@ -237,9 +274,17 @@ async def run_fantrax_sync():
         player_rows = []
 
         if stats_data:
-            for p in stats_data.get("playerStats", []):
-                pid = p.get("id", "")
-                if pid not in starter_ids:
+            logger.info(f"Stats keys: {list(stats_data.keys())[:10]}")
+            # Try common Fantrax player stats keys
+            player_list = (stats_data.get("playerStats") or
+                           stats_data.get("players") or
+                           stats_data.get("rosterStats") or [])
+            for p in player_list:
+                if not isinstance(p, dict):
+                    continue
+                pid = str(p.get("id") or p.get("playerId") or "")
+                # If no starters found, include everyone
+                if starter_ids and pid not in starter_ids:
                     continue
                 fantasy_team = player_team_map.get(pid)
                 if not fantasy_team or fantasy_team not in team_totals:
@@ -457,3 +502,4 @@ async def trigger_sync(request: Request):
     sync_state["last_sync_date"] = None
     asyncio.create_task(run_fantrax_sync())
     return {"ok": True, "message": "Fantrax sync triggered"}
+
