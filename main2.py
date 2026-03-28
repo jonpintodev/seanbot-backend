@@ -17,6 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from supabase import create_client, Client
 
+try:
+    from fantraxapi import FanTraxAPI
+    FANTRAXAPI_AVAILABLE = True
+except ImportError:
+    FANTRAXAPI_AVAILABLE = False
+    logger = None  # will be set below
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("seanbot")
 ET = ZoneInfo("America/New_York")
@@ -224,6 +231,54 @@ async def fetch_mlb_news() -> list:
         return []
 
 
+async def get_started_player_ids_fantraxapi() -> dict:
+    """
+    Use fantraxapi library to get started (non-bench, non-IL) player IDs
+    for each team for today's scoring period.
+    Returns: {fantrax_player_id: fantasy_team_name}
+    """
+    if not FANTRAXAPI_AVAILABLE:
+        logger.warning("fantraxapi not installed, skipping started filter")
+        return {}
+    try:
+        loop = asyncio.get_event_loop()
+        def _get_lineups():
+            api = FanTraxAPI(FANTRAX_LEAGUE_ID, username=FANTRAX_USERNAME, password=FANTRAX_PASSWORD)
+            league = api.league()
+            started = {}
+            today = date.today()
+            # Find today's scoring period number
+            period_num = None
+            for num, d in league.scoring_dates.items():
+                if d == today:
+                    period_num = num
+                    break
+            if period_num is None:
+                logger.warning(f"No scoring period found for {today}")
+                return {}
+            logger.info(f"Today's scoring period: {period_num}")
+            for team in league.teams:
+                try:
+                    roster = team.roster(period_num)
+                    for row in roster.rows:
+                        if row.player is None:
+                            continue
+                        pos = row.position.short_name if row.position else ""
+                        # Skip bench and IL slots
+                        if pos in ("BN", "IL", "IL+", "NA", "MINORS"):
+                            continue
+                        started[row.player.id] = team.name
+                except Exception as e:
+                    logger.error(f"Roster error for {team.name}: {e}")
+            logger.info(f"Started players found: {len(started)}")
+            return started
+        started = await loop.run_in_executor(None, _get_lineups)
+        return started
+    except Exception as e:
+        logger.error(f"fantraxapi lineup error: {e}")
+        return {}
+
+
 async def run_fantrax_sync():
     global FANTRAX_LOGGED_IN
     if sync_state["syncing"]:
@@ -244,17 +299,18 @@ async def run_fantrax_sync():
         # Clean up stale/invalid team names from previous syncs
         if supabase:
             valid_teams = TEAMS
-            # Delete team_stats rows not in valid list
             all_team_rows = supabase.table("team_stats").select("team_name").execute().data
             for row in all_team_rows:
                 if row["team_name"] not in valid_teams:
                     logger.info(f"Deleting stale team_stats: {row['team_name']}")
                     supabase.table("team_stats").delete().eq("team_name", row["team_name"]).execute()
-            # Delete player_stats rows with invalid fantasy_team
-            # (do in batches to avoid timeout)
-            for t in ["pinto!", "Designated Shitters", "Designated Shitters 🧻"]:
+            for t in ["pinto!", "Designated Shitters 🧻", "Designated Shitters 🚽"]:
                 supabase.table("player_stats").delete().eq("fantasy_team", t).execute()
-                logger.info(f"Cleaned player_stats for: {t}")
+
+        # Get today's started players via fantraxapi (bench/IL excluded)
+        started_map = await get_started_player_ids_fantraxapi()
+        use_started_filter = len(started_map) > 0
+        logger.info(f"Started filter active: {use_started_filter} ({len(started_map)} players)")
 
         # Step 1: Rosters — who owns which player
         roster_data = await fantrax_get(
@@ -309,9 +365,14 @@ async def run_fantrax_sync():
         sample_logged = False
 
         for fantrax_pid, fantasy_team_name in player_team_map.items():
-            status = player_status_map.get(fantrax_pid, "ACTIVE")
-            if status == "INJURED_RESERVE":
+            # If we have started lineup data, only count started players
+            if use_started_filter and fantrax_pid not in started_map:
                 continue
+            # Otherwise fall back to filtering out known bench/IR statuses
+            if not use_started_filter:
+                status = player_status_map.get(fantrax_pid, "ACTIVE").upper()
+                if status in ("INJURED_RESERVE", "IL", "IR", "MINORS", "NA"):
+                    continue
 
             # Exact match first, then normalize apostrophes/quotes
             matched_team = None
