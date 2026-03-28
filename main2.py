@@ -34,9 +34,9 @@ ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "changeme123")
 supabase: Optional[Client] = None
 TEAMS = [
     "Possibilities", "Yoshi's Islanders", "thebigfur", "Red Birds",
-    "Daddy Yankee", "pinto!", "JoanMacias", "Xavier", "Los Jankees",
+    "Daddy Yankee", "¡pinto!", "JoanMacias", "Xavier", "Los Jankees",
     "Momin8241", "ericliaci", "Sho Me The Money",
-    "Designated Shitters", "Arraezed & Hoerny"
+    "Designated Shitters 🚽", "Arraezed & Hoerny"
 ]
 sync_state = {"last_sync_date": None, "syncing": False, "last_sync_time": None, "status": "idle"}
 COOKIES = {}
@@ -255,14 +255,17 @@ async def run_fantrax_sync():
             if status == "INJURED_RESERVE":
                 continue
 
+            # Exact match first, then case-insensitive exact match
             matched_team = None
-            for t in TEAMS:
-                if (t.lower() == fantasy_team_name.lower() or
-                    fantasy_team_name.lower() in t.lower() or
-                    t.lower() in fantasy_team_name.lower()):
-                    matched_team = t
-                    break
+            if fantasy_team_name in TEAMS:
+                matched_team = fantasy_team_name
+            else:
+                for t in TEAMS:
+                    if t.lower() == fantasy_team_name.lower():
+                        matched_team = t
+                        break
             if not matched_team:
+                logger.warning(f"No team match for: '{fantasy_team_name}'")
                 continue
 
             pinfo = player_info_map.get(fantrax_pid, {})
