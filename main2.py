@@ -319,7 +319,23 @@ async def run_fantrax_sync():
             active_stat = "hr"
         else:
             active_stat = "rbi"
-        logger.info(f"Active stat for {today_str}: {active_stat}")
+        logger.info(f"Active stat: {active_stat}")
+
+        # Find all dates from league start to today that need processing
+        LEAGUE_START = date(2026, 3, 25)  # Opening Day
+        all_dates = []
+        d = LEAGUE_START
+        while d <= date.today():
+            all_dates.append(d.isoformat())
+            d = date.fromordinal(d.toordinal() + 1)
+
+        # Find which dates already have data in daily_stats
+        existing = supabase.table("daily_stats")            .select("stat_date")            .eq("stat_type", active_stat)            .execute().data if supabase else []
+        existing_dates = {row["stat_date"] for row in existing}
+
+        # Process missing dates + always reprocess today
+        dates_to_process = [d for d in all_dates if d not in existing_dates or d == today_str]
+        logger.info(f"Dates to process: {dates_to_process}")
 
         # Clean up stale/invalid team names from previous syncs
         if supabase:
@@ -383,13 +399,16 @@ async def run_fantrax_sync():
         del player_ids_data  # free memory
 
 
-        # Step 3: Process each player, write to Supabase immediately (no big list in RAM)
-        team_totals = {t: 0 for t in TEAMS}  # daily value for active stat only
+        # Step 3: For each missing date, fetch that day's stats for all rostered players
         processed = 0
         stats_calls = 0
-        sample_logged = False
 
-        for fantrax_pid, fantasy_team_name in player_team_map.items():
+        for process_date in dates_to_process:
+            logger.info(f"Processing date: {process_date}")
+            team_totals = {t: 0 for t in TEAMS}
+            sample_logged = False
+
+            for fantrax_pid, fantasy_team_name in player_team_map.items():
             # If we have started lineup data, only count started players
             if use_started_filter and fantrax_pid not in started_map:
                 continue
@@ -426,39 +445,69 @@ async def run_fantrax_sync():
             mlb_team = pinfo.get("team", "")
             position = pinfo.get("position", "")
 
-            # Get today's stats for this player for the active stat only
+            # Get this date's stats for this player
             stat_value = 0
             if name and name != fantrax_pid:
                 mlbam_id = await get_mlbam_id(name, mlb_team)
                 if mlbam_id:
-                    day_stats = await get_player_stats_for_date(mlbam_id, today_str)
+                    day_stats = await get_player_stats_for_date(mlbam_id, process_date)
                     stat_value = day_stats.get(active_stat, 0)
                     stats_calls += 1
 
             team_totals[matched_team] += stat_value
 
-            row = {
-                "player_id": fantrax_pid, "name": name,
-                "mlb_team": mlb_team, "position": position,
-                "fantasy_team": matched_team,
-                "rbi": stat_value if active_stat == "rbi" else 0,
-                "k":   stat_value if active_stat == "k"   else 0,
-                "h":   stat_value if active_stat == "h"   else 0,
-                "sb":  stat_value if active_stat == "sb"  else 0,
-                "hr":  stat_value if active_stat == "hr"  else 0,
-                "updated_at": today_str,
-            }
-
             if not sample_logged and stat_value > 0:
-                logger.info(f"Sample: {name} {active_stat}={stat_value}")
+                logger.info(f"  {process_date} {name} {active_stat}={stat_value} ({matched_team})")
                 sample_logged = True
-
-            if supabase:
-                supabase.table("player_stats").upsert(row, on_conflict="player_id").execute()
 
             processed += 1
 
-        logger.info(f"Players processed: {processed}, MLB API calls: {stats_calls}")
+            # Update player_stats leaderboard for today only
+            if process_date == today_str and supabase:
+                supabase.table("player_stats").upsert({
+                    "player_id": fantrax_pid, "name": name,
+                    "mlb_team": mlb_team, "position": position,
+                    "fantasy_team": matched_team,
+                    "rbi": stat_value if active_stat == "rbi" else 0,
+                    "k":   stat_value if active_stat == "k"   else 0,
+                    "h":   stat_value if active_stat == "h"   else 0,
+                    "sb":  stat_value if active_stat == "sb"  else 0,
+                    "hr":  stat_value if active_stat == "hr"  else 0,
+                    "updated_at": today_str,
+                }, on_conflict="player_id").execute()
+
+        # Save this date's team totals to daily_stats
+        if supabase:
+            for team_name, day_value in team_totals.items():
+                supabase.table("daily_stats").upsert({
+                    "stat_date": process_date,
+                    "fantasy_team": team_name,
+                    "stat_type": active_stat,
+                    "value": int(day_value),
+                    "updated_at": today_str
+                }, on_conflict="stat_date,fantasy_team,stat_type").execute()
+            logger.info(f"  Saved {process_date}: {dict(list(team_totals.items())[:3])}...")
+
+        # End of date loop - recompute monthly totals from all daily_stats
+        import calendar
+        month_str = today_str[:7]
+        year, mon = int(month_str[:4]), int(month_str[5:7])
+        last_day = calendar.monthrange(year, mon)[1]
+        if supabase:
+            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .gte("stat_date", f"{month_str}-01")                .lte("stat_date", f"{month_str}-{last_day:02d}")                .eq("stat_type", active_stat)                .execute().data
+            monthly_totals = {t: 0 for t in TEAMS}
+            for row in all_daily:
+                t = row["fantasy_team"]
+                if t in monthly_totals:
+                    monthly_totals[t] += row["value"]
+            stat_col = {"rbi": "rbi", "k": "strikeouts", "h": "hits",
+                        "sb": "stolen_bases", "hr": "home_runs"}[active_stat]
+            for team_name, total in monthly_totals.items():
+                supabase.table("team_stats").upsert({
+                    "team_name": team_name, "season": 2026,
+                    stat_col: total, "updated_at": today_str
+                }, on_conflict="team_name,season").execute()
+            logger.info(f"Monthly totals written. Top: {sorted(monthly_totals.items(), key=lambda x: -x[1])[:3]}")
 
         # Step 4: Write daily_stats rows (one per team per day)
         # Then recompute team_stats as sum of all daily_stats for the month
