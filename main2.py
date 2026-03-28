@@ -161,35 +161,44 @@ async def get_mlbam_id(name: str, mlb_team: str = "") -> Optional[int]:
     return None
 
 
-async def get_mlb_stats(player_name: str, mlb_team: str = "") -> dict:
-    """Get season batting + pitching stats from MLB Stats API using player name + team."""
-    empty = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+async def get_player_stats_for_date(mlbam_id: int, stat_date: str) -> dict:
+    """Get a player's stats for a specific date using MLB game log."""
+    result = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
     try:
-        mlbam_id = await get_mlbam_id(player_name, mlb_team)
-        if not mlbam_id:
-            return empty
-        url = f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats?stats=season&season={date.today().year}&group=hitting,pitching"
+        year = stat_date[:4]
+        hit_url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+                   f"?stats=gameLog&season={year}&group=hitting"
+                   f"&startDate={stat_date}&endDate={stat_date}")
         async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(url)
-        data = resp.json()
-        result = dict(empty)
-        for stat_group in data.get("stats", []):
-            splits = stat_group.get("splits", [])
-            if not splits:
-                continue
-            s = splits[0].get("stat", {})
-            group = stat_group.get("group", {}).get("displayName", "")
-            if group == "hitting":
-                result["rbi"] = s.get("rbi", 0) or 0
-                result["h"]   = s.get("hits", 0) or 0
-                result["hr"]  = s.get("homeRuns", 0) or 0
-                result["sb"]  = s.get("stolenBases", 0) or 0
-            elif group == "pitching":
-                result["k"]   = s.get("strikeOuts", 0) or 0
-        return result
+            resp = await c.get(hit_url)
+        for sg in resp.json().get("stats", []):
+            for split in sg.get("splits", []):
+                s = split.get("stat", {})
+                result["rbi"] += int(s.get("rbi", 0) or 0)
+                result["h"]   += int(s.get("hits", 0) or 0)
+                result["hr"]  += int(s.get("homeRuns", 0) or 0)
+                result["sb"]  += int(s.get("stolenBases", 0) or 0)
+        pit_url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+                   f"?stats=gameLog&season={year}&group=pitching"
+                   f"&startDate={stat_date}&endDate={stat_date}")
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.get(pit_url)
+        for sg in resp.json().get("stats", []):
+            for split in sg.get("splits", []):
+                s = split.get("stat", {})
+                result["k"] += int(s.get("strikeOuts", 0) or 0)
     except Exception as e:
-        logger.error(f"MLB stats error for {player_name}: {e}")
+        logger.error(f"Stats error for mlbam_id={mlbam_id} date={stat_date}: {e}")
+    return result
+
+
+async def get_mlb_stats(player_name: str, mlb_team: str = "") -> dict:
+    """Kept for compatibility — returns today's stats."""
+    empty = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+    mlbam_id = await get_mlbam_id(player_name, mlb_team)
+    if not mlbam_id:
         return empty
+    return await get_player_stats_for_date(mlbam_id, date.today().isoformat())
 
 
 async def get_todays_games() -> list:
@@ -296,6 +305,22 @@ async def run_fantrax_sync():
 
         today_str = date.today().isoformat()
 
+        # Determine which stat to track based on current month
+        month = date.today().month
+        if month in (3, 4):
+            active_stat = "rbi"
+        elif month == 5:
+            active_stat = "k"
+        elif month == 6:
+            active_stat = "h"
+        elif month == 7:
+            active_stat = "sb"
+        elif month == 8:
+            active_stat = "hr"
+        else:
+            active_stat = "rbi"
+        logger.info(f"Active stat for {today_str}: {active_stat}")
+
         # Clean up stale/invalid team names from previous syncs
         if supabase:
             valid_teams = TEAMS
@@ -359,7 +384,7 @@ async def run_fantrax_sync():
 
 
         # Step 3: Process each player, write to Supabase immediately (no big list in RAM)
-        team_totals = {t: {"rbi":0.0,"strikeouts":0.0,"hits":0.0,"stolen_bases":0.0,"home_runs":0.0} for t in TEAMS}
+        team_totals = {t: 0 for t in TEAMS}  # daily value for active stat only
         processed = 0
         stats_calls = 0
         sample_logged = False
@@ -401,43 +426,33 @@ async def run_fantrax_sync():
             mlb_team = pinfo.get("team", "")
             position = pinfo.get("position", "")
 
-            stats = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+            # Get today's stats for this player for the active stat only
+            stat_value = 0
             if name and name != fantrax_pid:
-                stats = await get_mlb_stats(name, mlb_team)
-                stats_calls += 1
-                # Zero out stats not needed this month
-                m = date.today().month
-                if m not in (3, 4):  stats["rbi"] = 0
-                if m != 5:           stats["k"] = 0
-                if m != 6:           stats["h"] = 0
-                if m != 7:           stats["sb"] = 0
-                if m != 8:           stats["hr"] = 0
+                mlbam_id = await get_mlbam_id(name, mlb_team)
+                if mlbam_id:
+                    day_stats = await get_player_stats_for_date(mlbam_id, today_str)
+                    stat_value = day_stats.get(active_stat, 0)
+                    stats_calls += 1
 
-            rbi = float(stats["rbi"])
-            h   = float(stats["h"])
-            hr  = float(stats["hr"])
-            sb  = float(stats["sb"])
-            kp  = float(stats["k"])
-
-            team_totals[matched_team]["rbi"]          += rbi
-            team_totals[matched_team]["hits"]         += h
-            team_totals[matched_team]["home_runs"]    += hr
-            team_totals[matched_team]["stolen_bases"] += sb
-            team_totals[matched_team]["strikeouts"]   += kp
+            team_totals[matched_team] += stat_value
 
             row = {
                 "player_id": fantrax_pid, "name": name,
                 "mlb_team": mlb_team, "position": position,
                 "fantasy_team": matched_team,
-                "rbi": rbi, "k": kp, "h": h, "sb": sb, "hr": hr,
+                "rbi": stat_value if active_stat == "rbi" else 0,
+                "k":   stat_value if active_stat == "k"   else 0,
+                "h":   stat_value if active_stat == "h"   else 0,
+                "sb":  stat_value if active_stat == "sb"  else 0,
+                "hr":  stat_value if active_stat == "hr"  else 0,
                 "updated_at": today_str,
             }
 
-            if not sample_logged:
-                logger.info(f"Sample: {row}")
+            if not sample_logged and stat_value > 0:
+                logger.info(f"Sample: {name} {active_stat}={stat_value}")
                 sample_logged = True
 
-            # Write immediately — no accumulation
             if supabase:
                 supabase.table("player_stats").upsert(row, on_conflict="player_id").execute()
 
@@ -445,14 +460,36 @@ async def run_fantrax_sync():
 
         logger.info(f"Players processed: {processed}, MLB API calls: {stats_calls}")
 
-        # Step 4: Write team totals
+        # Step 4: Write daily_stats rows (one per team per day)
+        # Then recompute team_stats as sum of all daily_stats for the month
         if supabase:
-            for team_name, stats in team_totals.items():
+            month_str = today_str[:7]  # e.g. "2026-03"
+            for team_name, day_value in team_totals.items():
+                # Upsert today's daily row
+                supabase.table("daily_stats").upsert({
+                    "stat_date": today_str,
+                    "fantasy_team": team_name,
+                    "stat_type": active_stat,
+                    "value": int(day_value),
+                    "updated_at": today_str
+                }, on_conflict="stat_date,fantasy_team,stat_type").execute()
+
+            # Recompute monthly totals from daily_stats
+            all_daily = supabase.table("daily_stats")                .select("fantasy_team,value")                .like("stat_date", f"{month_str}%")                .eq("stat_type", active_stat)                .execute().data
+
+            monthly_totals = {t: 0 for t in TEAMS}
+            for row in all_daily:
+                t = row["fantasy_team"]
+                if t in monthly_totals:
+                    monthly_totals[t] += row["value"]
+
+            # Write to team_stats for display
+            stat_col = {"rbi": "rbi", "k": "strikeouts", "h": "hits",
+                        "sb": "stolen_bases", "hr": "home_runs"}[active_stat]
+            for team_name, total in monthly_totals.items():
                 supabase.table("team_stats").upsert({
                     "team_name": team_name, "season": 2026,
-                    "rbi": int(stats["rbi"]), "strikeouts": int(stats["strikeouts"]),
-                    "hits": int(stats["hits"]), "stolen_bases": int(stats["stolen_bases"]),
-                    "home_runs": int(stats["home_runs"]), "updated_at": today_str
+                    stat_col: total, "updated_at": today_str
                 }, on_conflict="team_name,season").execute()
 
         now_et = datetime.now(ET).strftime("%b %d %I:%M %p ET")
@@ -534,6 +571,23 @@ async def get_status():
         "games_live": sum(1 for g in games if g["status"]["abstractGameState"] == "Live"),
         "time_et": datetime.now(ET).strftime("%I:%M %p ET"),
     }
+
+
+@app.get("/api/daily-stats")
+async def get_daily_stats(month: str = None):
+    """Return monthly cumulative stats from daily_stats table."""
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    if not month:
+        month = date.today().isoformat()[:7]  # e.g. "2026-03"
+    rows = supabase.table("daily_stats")        .select("fantasy_team,stat_type,value,stat_date")        .like("stat_date", f"{month}%")        .execute().data
+    # Sum by team
+    totals = {t: 0 for t in TEAMS}
+    for row in rows:
+        t = row["fantasy_team"]
+        if t in totals:
+            totals[t] += row["value"]
+    return {"month": month, "data": [{"team": t, "total": v} for t, v in sorted(totals.items(), key=lambda x: -x[1])]}
 
 
 @app.get("/api/team-stats")
