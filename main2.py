@@ -1,6 +1,6 @@
 """
 SeanBot 1.0 - Rusty Kuntz Dynasty League
-Final version: resolves player names via MLB Stats API
+Uses getPlayerIds for real names + MLB Stats API for season stats
 """
 
 import os
@@ -41,9 +41,6 @@ TEAMS = [
 sync_state = {"last_sync_date": None, "syncing": False, "last_sync_time": None, "status": "idle"}
 COOKIES = {}
 FANTRAX_LOGGED_IN = False
-
-# Cache for Fantrax ID -> player info (name, MLB team, position)
-PLAYER_INFO_CACHE: dict = {}
 
 
 async def fantrax_login() -> bool:
@@ -93,6 +90,33 @@ async def fantrax_get(path: str, params: dict = None) -> Optional[dict]:
     return None
 
 
+async def get_mlb_stats(mlb_id: int) -> dict:
+    """Get season batting + pitching stats from MLB Stats API."""
+    try:
+        url = f"https://statsapi.mlb.com/api/v1/people/{mlb_id}/stats?stats=season&season={date.today().year}&group=hitting,pitching"
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.get(url)
+        data = resp.json()
+        result = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+        for stat_group in data.get("stats", []):
+            splits = stat_group.get("splits", [])
+            if not splits:
+                continue
+            s = splits[0].get("stat", {})
+            group = stat_group.get("group", {}).get("displayName", "")
+            if group == "hitting":
+                result["rbi"] = s.get("rbi", 0) or 0
+                result["h"]   = s.get("hits", 0) or 0
+                result["hr"]  = s.get("homeRuns", 0) or 0
+                result["sb"]  = s.get("stolenBases", 0) or 0
+            elif group == "pitching":
+                result["k"]   = s.get("strikeOuts", 0) or 0
+        return result
+    except Exception as e:
+        logger.error(f"MLB stats error for {mlb_id}: {e}")
+        return {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+
+
 async def get_todays_games() -> list:
     today = date.today().strftime("%Y-%m-%d")
     try:
@@ -132,72 +156,6 @@ async def fetch_mlb_news() -> list:
         return []
 
 
-async def load_player_info_from_fantrax() -> dict:
-    """
-    Use getLeagueInfo playerInfo + getPlayerIds to resolve Fantrax IDs to real names.
-    Also try to get stats from MLB Stats API using the MLB player IDs.
-    """
-    global PLAYER_INFO_CACHE
-
-    # Get playerInfo from getLeagueInfo (has Fantrax IDs + metadata)
-    league_info = await fantrax_get(
-        "/fxea/general/getLeagueInfo",
-        {"leagueId": FANTRAX_LEAGUE_ID}
-    )
-
-    if not isinstance(league_info, dict):
-        return {}
-
-    player_info = league_info.get("playerInfo", {})
-    if not isinstance(player_info, dict) or not player_info:
-        logger.warning("playerInfo empty or wrong type")
-        return {}
-
-    logger.info(f"playerInfo has {len(player_info)} entries")
-
-    # Log first entry to understand structure
-    first_key = next(iter(player_info))
-    first_val = player_info[first_key]
-    logger.info(f"playerInfo sample key='{first_key}' val={json.dumps(first_val)[:500]}")
-
-    # Also get the official Fantrax player ID mapping (maps Fantrax ID to MLB/real info)
-    player_ids_data = await fantrax_get(
-        "/fxea/general/getPlayerIds",
-        {"sport": "MLB"}
-    )
-    if isinstance(player_ids_data, dict):
-        logger.info(f"getPlayerIds keys: {list(player_ids_data.keys())[:10]}")
-        # Log sample
-        items = list(player_ids_data.items())[:2]
-        for k, v in items:
-            logger.info(f"getPlayerIds sample: key='{k}' val={json.dumps(v)[:300]}")
-
-    PLAYER_INFO_CACHE = player_info
-    return player_info
-
-
-async def get_mlb_season_stats_for_player(mlb_id: int) -> dict:
-    """Get season batting stats from MLB Stats API for a specific player."""
-    try:
-        url = f"https://statsapi.mlb.com/api/v1/people/{mlb_id}/stats?stats=season&season={date.today().year}&group=hitting"
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(url)
-        data = resp.json()
-        splits = data.get("stats", [{}])[0].get("splits", [])
-        if splits:
-            s = splits[0].get("stat", {})
-            return {
-                "rbi": s.get("rbi", 0),
-                "h": s.get("hits", 0),
-                "hr": s.get("homeRuns", 0),
-                "sb": s.get("stolenBases", 0),
-                "k": s.get("strikeOuts", 0),
-            }
-    except:
-        pass
-    return {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
-
-
 async def run_fantrax_sync():
     global FANTRAX_LOGGED_IN
     if sync_state["syncing"]:
@@ -215,7 +173,7 @@ async def run_fantrax_sync():
 
         today_str = date.today().isoformat()
 
-        # Step 1: Get rosters (maps Fantrax player ID -> team + status)
+        # Step 1: Rosters — who owns which player
         roster_data = await fantrax_get(
             "/fxea/general/getTeamRosters",
             {"leagueId": FANTRAX_LEAGUE_ID}
@@ -238,21 +196,33 @@ async def run_fantrax_sync():
                         player_status_map[pid] = status
             logger.info(f"Roster: {len(player_team_map)} players across 14 teams")
 
-        # Step 2: Get playerInfo + playerIds to resolve names
-        player_info = await load_player_info_from_fantrax()
+        # Step 2: getPlayerIds — real names, MLB IDs, teams, positions
+        # Returns: {"fantraxId": {"name": "Last, First", "team": "BAL", "position": "SS", "statsIncId": 12345}}
+        player_ids_data = await fantrax_get(
+            "/fxea/general/getPlayerIds",
+            {"sport": "MLB"}
+        )
 
-        # Step 3: Build player records using MLB Stats API for actual stats
+        # Build lookup: fantrax_id -> {name, mlb_team, position, statsIncId}
+        player_info_map = {}
+        if isinstance(player_ids_data, dict):
+            for pid, pdata in player_ids_data.items():
+                if isinstance(pdata, dict):
+                    player_info_map[str(pid)] = pdata
+            logger.info(f"getPlayerIds: {len(player_info_map)} players")
+
+        # Step 3: Get real stats from MLB Stats API for each rostered player
         team_totals = {t: {"rbi":0.0,"strikeouts":0.0,"hits":0.0,"stolen_bases":0.0,"home_runs":0.0} for t in TEAMS}
         player_rows = []
-        stats_fetched = 0
+        stats_calls = 0
 
         for fantrax_pid, fantasy_team_name in player_team_map.items():
-            # Skip inactive players
+            # Skip injured reserve
             status = player_status_map.get(fantrax_pid, "ACTIVE")
-            if status in ("INJURED_RESERVE",):
+            if status == "INJURED_RESERVE":
                 continue
 
-            # Match to our team list
+            # Match fantasy team name to our list
             matched_team = None
             for t in TEAMS:
                 if (t.lower() == fantasy_team_name.lower() or
@@ -263,28 +233,25 @@ async def run_fantrax_sync():
             if not matched_team:
                 continue
 
-            # Get player metadata from playerInfo
-            pdata = player_info.get(fantrax_pid, {})
-            name = ""
-            mlb_team = ""
-            position = ""
-            mlb_id = None
+            # Get player info from getPlayerIds
+            pinfo = player_info_map.get(fantrax_pid, {})
+            raw_name = pinfo.get("name", "")  # "Last, First" format
+            # Convert "Henderson, Gunnar" -> "Gunnar Henderson"
+            if raw_name and "," in raw_name:
+                parts = raw_name.split(",", 1)
+                name = f"{parts[1].strip()} {parts[0].strip()}"
+            else:
+                name = raw_name or fantrax_pid
 
-            if isinstance(pdata, dict):
-                name = (pdata.get("name") or pdata.get("fullName") or
-                        pdata.get("playerName") or "")
-                mlb_team = (pdata.get("team") or pdata.get("mlbTeam") or
-                            pdata.get("proTeam") or "")
-                position = (pdata.get("position") or pdata.get("pos") or "")
-                # Try to get MLB Stats API ID
-                mlb_id = (pdata.get("mlbId") or pdata.get("statsIncId") or
-                          pdata.get("rotowireId") or pdata.get("espnId"))
+            mlb_team = pinfo.get("team", "")
+            position = pinfo.get("position", "")
+            stats_inc_id = pinfo.get("statsIncId")
 
-            # Get real stats from MLB Stats API if we have an MLB ID
+            # Get real season stats
             stats = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
-            if mlb_id and stats_fetched < 200:  # limit API calls
-                stats = await get_mlb_season_stats_for_player(int(mlb_id))
-                stats_fetched += 1
+            if stats_inc_id and stats_calls < 300:
+                stats = await get_mlb_stats(int(stats_inc_id))
+                stats_calls += 1
 
             rbi = float(stats["rbi"])
             h   = float(stats["h"])
@@ -300,7 +267,7 @@ async def run_fantrax_sync():
 
             player_rows.append({
                 "player_id": fantrax_pid,
-                "name": name or fantrax_pid,
+                "name": name,
                 "mlb_team": mlb_team,
                 "position": position,
                 "fantasy_team": matched_team,
@@ -308,11 +275,11 @@ async def run_fantrax_sync():
                 "updated_at": today_str,
             })
 
-        logger.info(f"Players processed: {len(player_rows)}, MLB API calls: {stats_fetched}")
-        logger.info(f"Sample player: {player_rows[0] if player_rows else 'none'}")
-        logger.info(f"Team totals sample: {dict(list(team_totals.items())[:3])}")
+        logger.info(f"Players processed: {len(player_rows)}, MLB API calls: {stats_calls}")
+        if player_rows:
+            logger.info(f"Sample: {player_rows[0]}")
 
-        # Write to Supabase
+        # Step 4: Write to Supabase
         if supabase:
             for team_name, stats in team_totals.items():
                 supabase.table("team_stats").upsert({
@@ -321,7 +288,6 @@ async def run_fantrax_sync():
                     "hits": int(stats["hits"]), "stolen_bases": int(stats["stolen_bases"]),
                     "home_runs": int(stats["home_runs"]), "updated_at": today_str
                 }, on_conflict="team_name,season").execute()
-
             for p in player_rows:
                 supabase.table("player_stats").upsert(p, on_conflict="player_id").execute()
 
@@ -329,7 +295,7 @@ async def run_fantrax_sync():
         sync_state["last_sync_date"] = today_str
         sync_state["last_sync_time"] = now_et
         sync_state["status"] = "done"
-        logger.info(f"Sync complete: {len(player_rows)} players [{now_et}]")
+        logger.info(f"Sync complete: {len(player_rows)} players, {stats_calls} MLB API calls [{now_et}]")
 
     except Exception as e:
         logger.error(f"Sync error: {e}", exc_info=True)
