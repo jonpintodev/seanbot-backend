@@ -48,7 +48,7 @@ SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6
 ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "changeme123")
 
 LEAGUE_START_DATE = date(2026, 3, 27)
-INACTIVE_SLOTS = {"BN","IL","IL+","NA","MINORS","RES","IR","INJURED_RESERVE"}
+INACTIVE_SLOTS = {"BN","IL","IL+","NA","MINORS","RES","IR","INJURED_RESERVE","RESERVE"}
 
 def active_stat_for_month(m: int) -> str:
     return {3:"rbi",4:"rbi",5:"k",6:"h",7:"sb",8:"hr"}.get(m,"rbi")
@@ -344,6 +344,46 @@ async def run_fantrax_sync():
             supabase.table("daily_lineups").upsert(
                 lineup_rows, on_conflict="score_date,fantasy_team,fantrax_player_id").execute()
 
+        # Write season stats to player_stats for individual leaders display
+        # This is separate from prize accounting — just for the leaderboard sidebar
+        logger.info(f"Writing season stats to player_stats for {len(lineup_rows)} players...")
+        for row in lineup_rows:
+            name = row["player_name"]; mlb_team = row["mlb_team"]; pid = row["fantrax_player_id"]
+            if not name or name == pid: continue
+            mlbam_id = await get_mlbam_id(name, mlb_team)
+            if not mlbam_id: continue
+            # Get season totals for display
+            try:
+                year = date.today().year
+                url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+                       f"?stats=season&season={year}&group=hitting,pitching")
+                async with httpx.AsyncClient(timeout=10) as c:
+                    resp = await c.get(url)
+                season_stats = {"rbi":0,"h":0,"hr":0,"sb":0,"k":0}
+                for sg in resp.json().get("stats",[]):
+                    splits = sg.get("splits",[])
+                    if not splits: continue
+                    s = splits[0].get("stat",{})
+                    grp = sg.get("group",{}).get("displayName","")
+                    if grp == "hitting":
+                        season_stats["rbi"] = int(s.get("rbi",0) or 0)
+                        season_stats["h"]   = int(s.get("hits",0) or 0)
+                        season_stats["hr"]  = int(s.get("homeRuns",0) or 0)
+                        season_stats["sb"]  = int(s.get("stolenBases",0) or 0)
+                    elif grp == "pitching":
+                        season_stats["k"]   = int(s.get("strikeOuts",0) or 0)
+                if supabase:
+                    supabase.table("player_stats").upsert({
+                        "player_id": pid, "name": name,
+                        "mlb_team": mlb_team, "position": row.get("slot",""),
+                        "fantasy_team": row["fantasy_team"],
+                        "rbi": season_stats["rbi"], "k": season_stats["k"],
+                        "h": season_stats["h"], "sb": season_stats["sb"],
+                        "hr": season_stats["hr"], "updated_at": today_str,
+                    }, on_conflict="player_id").execute()
+            except Exception as e:
+                logger.error(f"Season stats error for {name}: {e}")
+
         logger.info(f"Fetching {stat_type} for {len(active_rows)} active players on {today_str}...")
         stat_rows   = []
         api_calls   = 0
@@ -579,21 +619,98 @@ async def get_manual_entries(month: str = None):
 
 @app.get("/api/player-leaders/{stat}")
 async def get_player_leaders(stat: str, limit: int = 10):
+    """
+    MLB-wide player leaders from player_stats table (season totals).
+    This is display-only — not used for prize accounting.
+    Prize accounting uses daily_lineups + daily_player_stats.
+    """
     if stat not in ["rbi","k","h","sb","hr"]: raise HTTPException(400,"Invalid stat")
     if not supabase: raise HTTPException(503,"DB not configured")
-    month_str = date.today().isoformat()[:7]
-    stat_type = active_stat_for_month(date.today().month)
-    year, mon = int(month_str[:4]), int(month_str[5:7])
-    last_day  = calendar.monthrange(year,mon)[1]
-    rows = supabase.table("daily_player_stats").select("fantrax_player_id,player_name,value") \
-        .eq("stat_type",stat_type).gte("score_date",f"{month_str}-01") \
-        .lte("score_date",f"{month_str}-{last_day:02d}").execute().data
-    player_totals: dict = {}
-    for r in rows:
-        pid = r["fantrax_player_id"]
-        if pid not in player_totals: player_totals[pid] = {"name":r["player_name"],"value":0}
-        player_totals[pid]["value"] += r["value"]
-    return {"data":sorted(player_totals.values(),key=lambda x:-x["value"])[:limit]}
+    rows = supabase.table("player_stats").select(
+        f"name,fantasy_team,mlb_team,position,{stat}"
+    ).order(stat, desc=True).limit(limit).execute().data
+    return {"data": rows}
+
+@app.post("/api/refresh-mlb-stats")
+async def refresh_mlb_stats(request: Request):
+    """
+    Refresh player_stats table with current MLB season totals.
+    Used only for display (Individual Leaders, Daily Digest).
+    NOT used for prize accounting — that uses daily_lineups + daily_player_stats.
+    """
+    global FANTRAX_LOGGED_IN
+    body = await request.json()
+    if body.get("secret") != ADMIN_SECRET: raise HTTPException(403,"Unauthorized")
+    if not FANTRAX_LOGGED_IN:
+        ok = await fantrax_login()
+        if not ok: raise HTTPException(503,"Fantrax login failed")
+
+    async def _run():
+        roster_data = await fantrax_get("/fxea/general/getTeamRosters",{"leagueId":FANTRAX_LEAGUE_ID})
+        player_ids_data = await fantrax_get("/fxea/general/getPlayerIds",{"sport":"MLB"})
+        player_info = {}
+        if isinstance(player_ids_data, dict):
+            for pid, pdata in player_ids_data.items():
+                if isinstance(pdata, dict):
+                    raw = pdata.get("name","")
+                    if raw and "," in raw:
+                        parts = raw.split(",",1)
+                        name = f"{parts[1].strip()} {parts[0].strip()}"
+                    else:
+                        name = raw
+                    player_info[str(pid)] = {"name":name,"team":pdata.get("team",""),"position":pdata.get("position","")}
+            del player_ids_data
+
+        today = date.today().isoformat()
+        processed = 0
+        if roster_data and isinstance(roster_data.get("rosters"),dict):
+            for team_id, team_info in roster_data["rosters"].items():
+                if not isinstance(team_info,dict): continue
+                matched = match_team(team_info.get("teamName",""))
+                if not matched: continue
+                for player in team_info.get("rosterItems",[]):
+                    if not isinstance(player,dict): continue
+                    pid = str(player.get("id",""))
+                    if not pid: continue
+                    pinfo = player_info.get(pid,{})
+                    name = pinfo.get("name","")
+                    mlb_team = pinfo.get("team","")
+                    position = pinfo.get("position","")
+                    if not name or name == pid: continue
+                    mlbam_id = await get_mlbam_id(name, mlb_team)
+                    if not mlbam_id: continue
+                    # Get season totals for display
+                    url = (f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+                           f"?stats=season&season={date.today().year}&group=hitting,pitching")
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as c:
+                            resp = await c.get(url)
+                        result = {"rbi":0,"h":0,"hr":0,"sb":0,"k":0}
+                        for sg in resp.json().get("stats",[]):
+                            s = sg.get("splits",[{}])[0].get("stat",{}) if sg.get("splits") else {}
+                            g = sg.get("group",{}).get("displayName","")
+                            if g == "hitting":
+                                result["rbi"] = s.get("rbi",0) or 0
+                                result["h"]   = s.get("hits",0) or 0
+                                result["hr"]  = s.get("homeRuns",0) or 0
+                                result["sb"]  = s.get("stolenBases",0) or 0
+                            elif g == "pitching":
+                                result["k"]   = s.get("strikeOuts",0) or 0
+                        if supabase:
+                            supabase.table("player_stats").upsert({
+                                "player_id":pid,"name":name,"mlb_team":mlb_team,
+                                "position":position,"fantasy_team":matched,
+                                "rbi":result["rbi"],"k":result["k"],"h":result["h"],
+                                "sb":result["sb"],"hr":result["hr"],"updated_at":today
+                            }, on_conflict="player_id").execute()
+                        processed += 1
+                    except Exception as e:
+                        logger.error(f"MLB stats error {name}: {e}")
+        logger.info(f"MLB stats refresh complete: {processed} players")
+
+    asyncio.create_task(_run())
+    return {"ok":True,"message":"MLB stats refresh started (display only)"}
+
 
 @app.get("/api/mlb-scores")
 async def get_mlb_scores():
