@@ -228,33 +228,33 @@ async def run_fantrax_sync():
                         player_status_map[pid] = status
             logger.info(f"Roster: {len(player_team_map)} players across 14 teams")
 
-        # Step 2: getPlayerIds — real names, MLB IDs, teams, positions
-        # Returns: {"fantraxId": {"name": "Last, First", "team": "BAL", "position": "SS", "statsIncId": 12345}}
+        # Step 2: getPlayerIds — only keep rostered players to save memory
         player_ids_data = await fantrax_get(
             "/fxea/general/getPlayerIds",
             {"sport": "MLB"}
         )
 
-        # Build lookup: fantrax_id -> {name, mlb_team, position, statsIncId}
+        # Only store info for rostered players — don't hold 10k entries in RAM
+        rostered_ids = set(player_team_map.keys())
         player_info_map = {}
         if isinstance(player_ids_data, dict):
             for pid, pdata in player_ids_data.items():
-                if isinstance(pdata, dict):
+                if str(pid) in rostered_ids and isinstance(pdata, dict):
                     player_info_map[str(pid)] = pdata
-            logger.info(f"getPlayerIds: {len(player_info_map)} players")
+            logger.info(f"getPlayerIds: {len(player_info_map)} rostered players matched")
+        del player_ids_data  # free memory immediately
 
-        # Step 3: Get real stats from MLB Stats API for each rostered player
+        # Step 3: Process each player, write to Supabase immediately (no big list in RAM)
         team_totals = {t: {"rbi":0.0,"strikeouts":0.0,"hits":0.0,"stolen_bases":0.0,"home_runs":0.0} for t in TEAMS}
-        player_rows = []
+        processed = 0
         stats_calls = 0
+        sample_logged = False
 
         for fantrax_pid, fantasy_team_name in player_team_map.items():
-            # Skip injured reserve
             status = player_status_map.get(fantrax_pid, "ACTIVE")
             if status == "INJURED_RESERVE":
                 continue
 
-            # Match fantasy team name to our list
             matched_team = None
             for t in TEAMS:
                 if (t.lower() == fantasy_team_name.lower() or
@@ -265,10 +265,8 @@ async def run_fantrax_sync():
             if not matched_team:
                 continue
 
-            # Get player info from getPlayerIds
             pinfo = player_info_map.get(fantrax_pid, {})
-            raw_name = pinfo.get("name", "")  # "Last, First" format
-            # Convert "Henderson, Gunnar" -> "Gunnar Henderson"
+            raw_name = pinfo.get("name", "")
             if raw_name and "," in raw_name:
                 parts = raw_name.split(",", 1)
                 name = f"{parts[1].strip()} {parts[0].strip()}"
@@ -277,11 +275,9 @@ async def run_fantrax_sync():
 
             mlb_team = pinfo.get("team", "")
             position = pinfo.get("position", "")
-            stats_inc_id = pinfo.get("statsIncId")
 
-            # Get real season stats
             stats = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
-            if name and stats_calls < 300:
+            if name and name != fantrax_pid:
                 stats = await get_mlb_stats(name)
                 stats_calls += 1
 
@@ -297,21 +293,27 @@ async def run_fantrax_sync():
             team_totals[matched_team]["stolen_bases"] += sb
             team_totals[matched_team]["strikeouts"]   += kp
 
-            player_rows.append({
-                "player_id": fantrax_pid,
-                "name": name,
-                "mlb_team": mlb_team,
-                "position": position,
+            row = {
+                "player_id": fantrax_pid, "name": name,
+                "mlb_team": mlb_team, "position": position,
                 "fantasy_team": matched_team,
                 "rbi": rbi, "k": kp, "h": h, "sb": sb, "hr": hr,
                 "updated_at": today_str,
-            })
+            }
 
-        logger.info(f"Players processed: {len(player_rows)}, MLB API calls: {stats_calls}")
-        if player_rows:
-            logger.info(f"Sample: {player_rows[0]}")
+            if not sample_logged:
+                logger.info(f"Sample: {row}")
+                sample_logged = True
 
-        # Step 4: Write to Supabase
+            # Write immediately — no accumulation
+            if supabase:
+                supabase.table("player_stats").upsert(row, on_conflict="player_id").execute()
+
+            processed += 1
+
+        logger.info(f"Players processed: {processed}, MLB API calls: {stats_calls}")
+
+        # Step 4: Write team totals
         if supabase:
             for team_name, stats in team_totals.items():
                 supabase.table("team_stats").upsert({
@@ -320,14 +322,12 @@ async def run_fantrax_sync():
                     "hits": int(stats["hits"]), "stolen_bases": int(stats["stolen_bases"]),
                     "home_runs": int(stats["home_runs"]), "updated_at": today_str
                 }, on_conflict="team_name,season").execute()
-            for p in player_rows:
-                supabase.table("player_stats").upsert(p, on_conflict="player_id").execute()
 
         now_et = datetime.now(ET).strftime("%b %d %I:%M %p ET")
         sync_state["last_sync_date"] = today_str
         sync_state["last_sync_time"] = now_et
         sync_state["status"] = "done"
-        logger.info(f"Sync complete: {len(player_rows)} players, {stats_calls} MLB API calls [{now_et}]")
+        logger.info(f"Sync complete: {processed} players, {stats_calls} MLB API calls [{now_et}]")
 
     except Exception as e:
         logger.error(f"Sync error: {e}", exc_info=True)
