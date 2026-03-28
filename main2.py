@@ -416,6 +416,8 @@ async def run_fantrax_sync():
 
         totals   = recompute_monthly_totals(month_str, stat_type)
         stat_col = {"rbi":"rbi","k":"strikeouts","h":"hits","sb":"stolen_bases","hr":"home_runs"}[stat_type]
+        nonzero = {t:v for t,v in totals.items() if v > 0}
+        logger.info(f"Sync totals for {month_str}: {nonzero if nonzero else 'ALL ZERO'}")
         if supabase:
             for team_name, total in totals.items():
                 supabase.table("monthly_totals").upsert(
