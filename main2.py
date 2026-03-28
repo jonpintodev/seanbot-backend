@@ -762,12 +762,39 @@ async def trigger_sync(request: Request):
     if body.get("secret") != ADMIN_SECRET: raise HTTPException(403,"Unauthorized")
     override = body.get("team_override")
     if override and supabase:
-        team = override.get("team"); stat = override.get("stat"); val = int(override.get("value",0))
-        if stat in {"rbi","strikeouts","hits","stolen_bases","home_runs"} and team:
-            supabase.table("team_stats").upsert(
-                {"team_name":team,"season":2026,stat:val,"updated_at":date.today().isoformat()},
-                on_conflict="team_name,season").execute()
-            return {"ok":True,"message":f"Override: {team} {stat}={val}"}
+        team      = override.get("team")
+        stat      = override.get("stat")
+        val       = int(override.get("value", 0))
+        score_date = override.get("score_date", date.today().isoformat())
+        # Map team_stats col names back to stat_type keys
+        stat_map  = {"rbi":"rbi","strikeouts":"k","hits":"h","stolen_bases":"sb","home_runs":"hr"}
+        stat_type = stat_map.get(stat, stat)
+        if stat_type in {"rbi","k","h","sb","hr"} and team:
+            # Write to manual_score_entries so it accumulates correctly
+            supabase.table("manual_score_entries").upsert({
+                "score_date": score_date,
+                "fantasy_team": team,
+                "stat_type": stat_type,
+                "value": val,
+                "source": "manual",
+                "note": f"Admin override for {score_date}",
+                "entered_at": datetime.now(ET).isoformat(),
+            }, on_conflict="score_date,fantasy_team,stat_type").execute()
+            # Recompute monthly totals including all manual entries
+            month_str = score_date[:7]
+            totals    = recompute_monthly_totals(month_str, stat_type)
+            stat_col  = {"rbi":"rbi","k":"strikeouts","h":"hits","sb":"stolen_bases","hr":"home_runs"}[stat_type]
+            today_str = date.today().isoformat()
+            for team_name, total in totals.items():
+                supabase.table("monthly_totals").upsert({
+                    "month":month_str,"fantasy_team":team_name,
+                    "stat_type":stat_type,"total":total,"updated_at":today_str
+                }, on_conflict="month,fantasy_team,stat_type").execute()
+                supabase.table("team_stats").upsert({
+                    "team_name":team_name,"season":2026,
+                    stat_col:total,"updated_at":today_str
+                }, on_conflict="team_name,season").execute()
+            return {"ok":True,"message":f"Saved {team} {score_date} {stat_type}={val}, monthly total updated"}
     sync_state["last_sync_date"] = None
     FANTRAX_LOGGED_IN = False
     asyncio.create_task(run_fantrax_sync())
