@@ -90,14 +90,46 @@ async def fantrax_get(path: str, params: dict = None) -> Optional[dict]:
     return None
 
 
-async def get_mlb_stats(mlb_id: int) -> dict:
-    """Get season batting + pitching stats from MLB Stats API."""
+# Cache: player name -> MLBAM ID
+MLBAM_ID_CACHE: dict = {}
+
+async def get_mlbam_id(name: str) -> Optional[int]:
+    """Search MLB Stats API by name to get MLBAM player ID."""
+    if name in MLBAM_ID_CACHE:
+        return MLBAM_ID_CACHE[name]
     try:
-        url = f"https://statsapi.mlb.com/api/v1/people/{mlb_id}/stats?stats=season&season={date.today().year}&group=hitting,pitching"
+        # Search by last name first
+        last = name.split()[-1] if name else ""
+        url = f"https://statsapi.mlb.com/api/v1/people/search?names={last}&sportId=1"
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.get(url)
+        people = resp.json().get("people", [])
+        # Find best match
+        name_lower = name.lower()
+        for p in people:
+            full = p.get("fullName", "").lower()
+            if full == name_lower or name_lower in full or full in name_lower:
+                mlbam_id = p.get("id")
+                if mlbam_id:
+                    MLBAM_ID_CACHE[name] = mlbam_id
+                    return mlbam_id
+    except Exception as e:
+        logger.error(f"MLBAM lookup error for {name}: {e}")
+    return None
+
+
+async def get_mlb_stats(player_name: str) -> dict:
+    """Get season batting + pitching stats from MLB Stats API using player name."""
+    empty = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+    try:
+        mlbam_id = await get_mlbam_id(player_name)
+        if not mlbam_id:
+            return empty
+        url = f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats?stats=season&season={date.today().year}&group=hitting,pitching"
         async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(url)
         data = resp.json()
-        result = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+        result = dict(empty)
         for stat_group in data.get("stats", []):
             splits = stat_group.get("splits", [])
             if not splits:
@@ -113,8 +145,8 @@ async def get_mlb_stats(mlb_id: int) -> dict:
                 result["k"]   = s.get("strikeOuts", 0) or 0
         return result
     except Exception as e:
-        logger.error(f"MLB stats error for {mlb_id}: {e}")
-        return {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
+        logger.error(f"MLB stats error for {player_name}: {e}")
+        return empty
 
 
 async def get_todays_games() -> list:
@@ -249,8 +281,8 @@ async def run_fantrax_sync():
 
             # Get real season stats
             stats = {"rbi": 0, "h": 0, "hr": 0, "sb": 0, "k": 0}
-            if stats_inc_id and stats_calls < 300:
-                stats = await get_mlb_stats(int(stats_inc_id))
+            if name and stats_calls < 300:
+                stats = await get_mlb_stats(name)
                 stats_calls += 1
 
             rbi = float(stats["rbi"])
