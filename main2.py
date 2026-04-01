@@ -49,8 +49,20 @@ def get_month_range(month_str: str):
     return f"{month_str}-01", f"{month_str}-{last:02d}"
 
 
+# Prize period ranges — RBI covers Mar+Apr together, others are single months
+STAT_DATE_RANGES = {
+    "rbi":          ("2026-03-01", "2026-04-30"),
+    "strikeouts":   ("2026-05-01", "2026-05-31"),
+    "hits":         ("2026-06-01", "2026-06-30"),
+    "stolen_bases": ("2026-07-01", "2026-07-31"),
+    "home_runs":    ("2026-08-01", "2026-08-31"),
+}
+
 def compute_standings(stat: str, month_str: str) -> list:
-    start, end = get_month_range(month_str)
+    if stat in STAT_DATE_RANGES:
+        start, end = STAT_DATE_RANGES[stat]
+    else:
+        start, end = get_month_range(month_str)
     rows = supabase.table("daily_stats") \
         .select("team_name,value") \
         .eq("stat", stat) \
@@ -213,7 +225,7 @@ async def get_daily_entries(score_date: str, stat: str = "rbi"):
     if not supabase:
         raise HTTPException(503, "DB not configured")
     rows = supabase.table("daily_stats") \
-        .select("team_name,value,note") \
+        .select("team_name,value") \
         .eq("score_date", score_date) \
         .eq("stat", stat) \
         .execute().data
